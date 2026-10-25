@@ -328,10 +328,10 @@ def create_ocp_solver(
     # Input weights (reference is upright orientation and hover thrust)
     R = np.diag(
         [
-            1.0,  # rpy
-            1.0,  # rpy
-            1.0,  # rpy
-            50.0,  # thrust
+            30.0,  # rpy
+            30.0,  # rpy
+            30.0,  # rpy
+            40.0,  # thrust
         ]
     )
 
