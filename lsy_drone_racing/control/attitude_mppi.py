@@ -110,8 +110,8 @@ COST_WEIGHTS = {
     "deviation_weight": 0.2,  # Weight for deviation from reference trajectory
     "velocity_weight": 0.1,  # Weight for deviation from reference velocity
     "smoothness_weight": 0.01,  # Weight for control smoothness
-    "gate_weight": 4.0,  # Weight for gate pass / collision / miss
-    "obstacle_weight": 3.0,  # Weight for coming close to an obstacle
+    "gate_weight": 100.0,  # Weight for gate pass / collision / miss
+    "obstacle_weight": 50.0,  # Weight for coming close to an obstacle
 }
 
 MLC_CONSTANTS = {
