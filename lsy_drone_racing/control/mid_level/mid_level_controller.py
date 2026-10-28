@@ -14,6 +14,7 @@ class MidLevelController:
         a_brake_max,
         v_gate_max=None,
         gate_window=0.5,
+        gate_plateau=0.0,
         progress_window=(0.2, 0.2),
     ):
 
@@ -23,6 +24,8 @@ class MidLevelController:
         # speed cap at a gate's progress, rising linearly back to v_max gate_window [m] progress away
         self.v_gate_max = v_max if v_gate_max is None else v_gate_max
         self.gate_window = gate_window
+        # the cap is flat within gate_plateau [m] of a gate's progress, so it holds until the gate is revealed
+        self.gate_plateau = gate_plateau
         self.a_long_max = a_long_max
         self.a_lat_max = a_lat_max
         self.a_brake_max = a_brake_max
@@ -93,7 +96,9 @@ class MidLevelController:
         slow_down = is_pass.any(axis=0) & ~obs["gates_visited"]
         s_gate = s[is_pass.argmax(axis=0)][slow_down]  # progress of the first pass of each gate
 
-        closeness = np.clip(np.abs(s[:, None] - s_gate[None, :]) / self.gate_window, 0.0, 1.0)
+        closeness = np.clip(
+            (np.abs(s[:, None] - s_gate[None, :]) - self.gate_plateau) / self.gate_window, 0.0, 1.0
+        )
         closeness = closeness.min(axis=1, initial=1.0)
         v = np.minimum(v, self.v_gate_max + (self.v_max - self.v_gate_max) * closeness)
 
