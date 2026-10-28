@@ -100,7 +100,7 @@ COST_CONSTANTS = {
     "deviation_tolerance": 0.13,  # Tolerance in meters for an acceptable deviation from the reference trajectory
     "velocity_tolerance": 0.5,  # Tolerance in m/s for an acceptable deviation from the reference velocity
     "smoothness_tolerance": 1.0,  # Tolerance for control smoothness in multiples of sigma
-    "gate_tolerance": 0.05,  # Tolerance in meters for an acceptable deviation from the gate's center
+    "gate_tolerance": 0.07,  # Tolerance in meters for an acceptable deviation from the gate's center
     "gate_slab": 0.1,  # Half-thickness in meters around a gate's plane in which the gate is checked
     "gate_frame_limit": 0.45,  # Offset in meters from the gate's center beyond which the frame is cleared
     "obstacle_radius": 0.2,  # Radius in meters of the penalty tube around an obstacle
@@ -248,6 +248,15 @@ def gate_outline(pos: NDArray, quat: NDArray, half: float) -> NDArray:
         [[0, -half, -half], [0, half, -half], [0, half, half], [0, -half, half], [0, -half, -half]]
     )
     return pos + R.from_quat(quat).apply(corners)
+
+
+def circle_outline(center_xy: NDArray, z: float, radius: float, n: int = 32) -> NDArray:
+    """Return a closed horizontal circle around `center_xy` at height `z`, shape (n + 1, 3)."""
+    angle = np.linspace(0, 2 * np.pi, n + 1)
+    return np.stack(
+        (center_xy[0] + radius * np.cos(angle), center_xy[1] + radius * np.sin(angle),
+         np.full(n + 1, z)), axis=-1,
+    )
 
 
 def speed_to_rgba(speed: NDArray, alpha: float = 1.0) -> NDArray:
@@ -427,6 +436,8 @@ class AttitudeMPPI(Controller):
         self._finished = False
         self._gate_now = None  # (positions, quaternions) of the currently perceived gates
         self._gate_old = []  # per gate, the poses that were perceived before the current one
+        self._obstacle_now = None  # positions of the currently perceived obstacles
+        self._obstacle_old = []  # per obstacle, the positions perceived before the current one
 
         self._ref = self._mlc.get_trajectory(obs, self._horizon, self._dt)
 
@@ -470,6 +481,7 @@ class AttitudeMPPI(Controller):
 
         self._ref = self._mlc.get_trajectory(obs, self._horizon, self._dt)
         self._track_gate_perception(obs)
+        self._track_obstacle_perception(obs)
 
         # Fresh noise every step: split the key, keep one half and use the other
         self._key, subkey = jax.random.split(self._key)
@@ -522,6 +534,7 @@ class AttitudeMPPI(Controller):
             draw_line(sim, ref_pos[i : i + 2], rgba=colors[i], start_size=3.0, end_size=3.0)
 
         self._draw_gate_perception(sim)
+        self._draw_obstacle_perception(sim)
 
         if self._vis is None:
             return
@@ -587,10 +600,51 @@ class AttitudeMPPI(Controller):
                 sim, gate_outline(pos, quat, tolerance), rgba=cyan, start_size=2.0, end_size=2.0
             )
 
+    def _track_obstacle_perception(self, obs: dict[str, NDArray[np.floating]]):
+        """Store the previously perceived position of every obstacle whose observed position changed."""
+        pos = np.array(obs["obstacles_pos"])
+        if self._obstacle_now is None:
+            self._obstacle_old = [[] for _ in pos]
+        else:
+            for i in range(len(pos)):
+                if not np.allclose(pos[i], self._obstacle_now[i], atol=1e-6):
+                    self._obstacle_old[i].append(self._obstacle_now[i])
+        self._obstacle_now = pos
+
+    def _draw_obstacle_perception(self, sim: Sim):
+        """Draw each obstacle's pole and penalty tube, current boldly and earlier ones faintly."""
+        if self._obstacle_now is None:
+            return
+        cyan, orange = (0.0, 0.9, 1.0, 1.0), (1.0, 0.5, 0.0, 0.4)
+        radius = COST_CONSTANTS["obstacle_radius"]
+        z_tube = float(self._ref[0, 2])  # tube is drawn at the height the drone is flying at
+        for i, pos in enumerate(self._obstacle_now):
+            # Earlier perceptions, linked to where the obstacle is perceived now
+            for old_pos in self._obstacle_old[i]:
+                pole = np.array([[*old_pos[:2], 0.0], old_pos])
+                draw_line(sim, pole, rgba=orange, start_size=1.5, end_size=1.5)
+                draw_line(
+                    sim, circle_outline(old_pos[:2], z_tube, radius), rgba=orange,
+                    start_size=1.5, end_size=1.5,
+                )
+                draw_line(
+                    sim, np.stack(([*old_pos[:2], z_tube], [*pos[:2], z_tube])), rgba=orange,
+                    start_size=1.5, end_size=1.5,
+                )
+            # Current perception: the pole and the tube radius the obstacle cost penalizes
+            draw_line(
+                sim, np.array([[*pos[:2], 0.0], pos]), rgba=cyan, start_size=4.0, end_size=4.0
+            )
+            draw_line(
+                sim, circle_outline(pos[:2], z_tube, radius), rgba=cyan,
+                start_size=2.0, end_size=2.0,
+            )
+
     def episode_callback(self):
         """Reset the internal state."""
         self._finished = False
         self._gate_now = None
+        self._obstacle_now = None
         self._U_nom = jnp.tile(jnp.array([0.0, 0.0, 0.0, self._hover_thrust]), (self._horizon, 1))
         self._u_prev = self._U_nom[0]
 
