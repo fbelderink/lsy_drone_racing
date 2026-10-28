@@ -237,8 +237,17 @@ def adaptive_lambda(costs: Array, target_ess: float, n_iter: int = 30) -> Array:
     return jnp.exp(0.5 * (lo + hi))
 
 
+GATE_OPENING_HALF = 0.2  # half width in meters of a gate's opening
 N_VIS_BEST = 10  # lowest-cost rollouts that are drawn
 N_VIS_RANDOM = 30  # additional evenly strided rollouts that are drawn
+
+
+def gate_outline(pos: NDArray, quat: NDArray, half: float) -> NDArray:
+    """Return the closed square of half width `half` in a gate's plane, shape (5, 3)."""
+    corners = np.array(
+        [[0, -half, -half], [0, half, -half], [0, half, half], [0, -half, half], [0, -half, -half]]
+    )
+    return pos + R.from_quat(quat).apply(corners)
 
 
 def speed_to_rgba(speed: NDArray, alpha: float = 1.0) -> NDArray:
@@ -416,6 +425,8 @@ class AttitudeMPPI(Controller):
         self._ess = float("nan")
         self._vis = None  # (rollout positions, rollout weights, mean path), set in compute_control
         self._finished = False
+        self._gate_now = None  # (positions, quaternions) of the currently perceived gates
+        self._gate_old = []  # per gate, the poses that were perceived before the current one
 
         self._ref = self._mlc.get_trajectory(obs, self._horizon, self._dt)
 
@@ -458,6 +469,7 @@ class AttitudeMPPI(Controller):
             self._finished = True
 
         self._ref = self._mlc.get_trajectory(obs, self._horizon, self._dt)
+        self._track_gate_perception(obs)
 
         # Fresh noise every step: split the key, keep one half and use the other
         self._key, subkey = jax.random.split(self._key)
@@ -509,6 +521,8 @@ class AttitudeMPPI(Controller):
         for i in range(len(ref_pos) - 1):
             draw_line(sim, ref_pos[i : i + 2], rgba=colors[i], start_size=3.0, end_size=3.0)
 
+        self._draw_gate_perception(sim)
+
         if self._vis is None:
             return
         # Reference point the drone should be tracking right now
@@ -530,9 +544,53 @@ class AttitudeMPPI(Controller):
         draw_line(sim, mean_path, rgba=(1.0, 0.0, 1.0, 1.0), start_size=4.5, end_size=4.5)
         draw_points(sim, mean_path, rgba=(1.0, 0.0, 1.0, 1.0), size=0.01)
 
+    def _track_gate_perception(self, obs: dict[str, NDArray[np.floating]]):
+        """Store the previously perceived pose of every gate whose observed pose just changed."""
+        pos, quat = np.array(obs["gates_pos"]), np.array(obs["gates_quat"])
+        if self._gate_now is None:
+            self._gate_old = [[] for _ in pos]
+        else:
+            for i in range(len(pos)):
+                same = np.allclose(pos[i], self._gate_now[0][i], atol=1e-6) and np.allclose(
+                    quat[i], self._gate_now[1][i], atol=1e-6
+                )
+                if not same:
+                    self._gate_old[i].append((self._gate_now[0][i], self._gate_now[1][i]))
+        self._gate_now = (pos, quat)
+
+    def _draw_gate_perception(self, sim: Sim):
+        """Draw the current gate perception boldly and earlier perceptions faintly with a link."""
+        if self._gate_now is None:
+            return
+        cyan, orange = (0.0, 0.9, 1.0, 1.0), (1.0, 0.5, 0.0, 0.4)
+        tolerance = COST_CONSTANTS["gate_tolerance"]
+        for i, (pos, quat) in enumerate(zip(*self._gate_now)):
+            # Earlier perceptions, linked to where the gate is perceived now
+            for old_pos, old_quat in self._gate_old[i]:
+                draw_line(
+                    sim,
+                    gate_outline(old_pos, old_quat, GATE_OPENING_HALF),
+                    rgba=orange,
+                    start_size=1.5,
+                    end_size=1.5,
+                )
+                draw_line(sim, np.stack((old_pos, pos)), rgba=orange, start_size=1.5, end_size=1.5)
+            # Current perception: opening and the tolerance square the gate cost treats as free
+            draw_line(
+                sim,
+                gate_outline(pos, quat, GATE_OPENING_HALF),
+                rgba=cyan,
+                start_size=4.0,
+                end_size=4.0,
+            )
+            draw_line(
+                sim, gate_outline(pos, quat, tolerance), rgba=cyan, start_size=2.0, end_size=2.0
+            )
+
     def episode_callback(self):
         """Reset the internal state."""
         self._finished = False
+        self._gate_now = None
         self._U_nom = jnp.tile(jnp.array([0.0, 0.0, 0.0, self._hover_thrust]), (self._horizon, 1))
         self._u_prev = self._U_nom[0]
 
