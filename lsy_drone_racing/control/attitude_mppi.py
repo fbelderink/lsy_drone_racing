@@ -98,6 +98,7 @@ def rollout(x0: Array, U: Array, params: dict, dt: float) -> Array:
 
 COST_CONSTANTS = {
     "deviation_tolerance": 0.13,  # Tolerance in meters for an acceptable deviation from the reference trajectory
+    "velocity_tolerance": 0.5,  # Tolerance in m/s for an acceptable deviation from the reference velocity
     "smoothness_tolerance": 1.0,  # Tolerance for control smoothness in multiples of sigma
     "gate_tolerance": 0.05,  # Tolerance in meters for an acceptable deviation from the gate's center
     "gate_slab": 0.1,  # Half-thickness in meters around a gate's plane in which the gate is checked
@@ -107,6 +108,7 @@ COST_CONSTANTS = {
 
 COST_WEIGHTS = {
     "deviation_weight": 0.2,  # Weight for deviation from reference trajectory
+    "velocity_weight": 0.1,  # Weight for deviation from reference velocity
     "smoothness_weight": 0.01,  # Weight for control smoothness
     "gate_weight": 4.0,  # Weight for gate pass / collision / miss
     "obstacle_weight": 3.0,  # Weight for coming close to an obstacle
@@ -148,6 +150,11 @@ def trajectory_cost(
     tol = jnp.maximum(1e-6, COST_CONSTANTS["deviation_tolerance"])
     pos_error_per_step = jnp.square((pos - ref_pos) / tol)  # Compute per-step position error
     deviation_cost = jnp.sum(pos_error_per_step)
+
+    # Deviation from the reference velocity, so the speed profile (e.g. slowing before gates) is followed
+    vel_tol = jnp.maximum(1e-6, COST_CONSTANTS["velocity_tolerance"])
+    vel_error_per_step = jnp.square((X[:, 6:9] - ref[:, 3:6]) / vel_tol)
+    velocity_cost = jnp.sum(vel_error_per_step)
 
     # Cost for control smoothness
     U_including_prev = jnp.vstack(
@@ -191,6 +198,7 @@ def trajectory_cost(
 
     total_cost = (
         COST_WEIGHTS["deviation_weight"] * deviation_cost
+        + COST_WEIGHTS["velocity_weight"] * velocity_cost
         + COST_WEIGHTS["smoothness_weight"] * smoothness_cost
         + COST_WEIGHTS["gate_weight"] * gate_cost
         + COST_WEIGHTS["obstacle_weight"] * obstacle_cost
@@ -376,7 +384,7 @@ class AttitudeMPPI(Controller):
         self._horizon = 30  # planning steps, 0.5 s at 50 Hz
         self._n_samples = 1024  # sampled control sequences per step
         self._sigma = (
-            jnp.array([0.15, 0.15, 0.0, 0.05]) * 2.0
+            jnp.array([0.15, 0.15, 0.0, 0.05]) * 6.0
         )  # noise std: roll, pitch, yaw, thrust
         self._target_ess = (
             0.05  # fraction of samples that should effectively contribute to the update
