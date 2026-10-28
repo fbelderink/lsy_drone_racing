@@ -119,7 +119,8 @@ MLC_CONSTANTS = {
     "a_long_max": 8.0,  # most important in the current setup for speed
     "a_lat_max": 5.0,
     "a_brake_max": 7.0,
-    "v_gate_max": 1.0,  # speed cap at a gate's center
+    "v_gate_max": 2.0,  # speed cap within the plateau around a gate
+    "gate_plateau": 0.9,  # progress in meters before and after a gate over which the cap stays flat (sensor range plus margin)
     "gate_window": 1.0,  # progress in meters before and after a gate over which the cap applies
 }
 
@@ -423,6 +424,7 @@ class AttitudeMPPI(Controller):
             a_brake_max=MLC_CONSTANTS["a_brake_max"],
             v_gate_max=MLC_CONSTANTS["v_gate_max"],
             gate_window=MLC_CONSTANTS["gate_window"],
+            gate_plateau=MLC_CONSTANTS["gate_plateau"],
         )
 
         # n_samples fixes an array shape, so it must be static for jit
