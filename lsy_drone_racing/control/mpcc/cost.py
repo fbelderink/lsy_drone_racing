@@ -24,12 +24,11 @@ if TYPE_CHECKING:
 
     from lsy_drone_racing.control.mpcc.path import ArcLengthPath
 
-# Placeholder values until an optimizer uses this cost
 MPCC_WEIGHTS = {
-    "q_nom": 1.0,  # Contour weight away from gates
-    "q_wp": 100.0,  # Additional contour weight at a gate's center
+    "q_nom": 25.0,  # Contour weight away from gates
+    "q_wp": 800.0,  # Additional contour weight at a gate's center, high so gates are not cut
     "gate_sigma": 0.3,  # Width in meters of the Gaussian around each gate
-    "q_lag": 100.0,  # Lag weight, high so that theta stays a good estimate of the closest point
+    "q_lag": 200.0,  # Lag weight, high so that theta stays a good estimate of the closest point
     "q_rates": 0.01,  # Weight for rpy rates
     "r_du": jnp.array([1.0, 1.0, 1.0, 1.0]),  # Weights for command changes per channel
     "r_dv_theta": 0.01,  # Weight for changes of the progress speed
@@ -76,7 +75,12 @@ def contour_weight(path_pos: Array, gates_pos: Array, weights: dict) -> Array:
 
 
 def progress_step(
-    theta: Array, v_theta: Array, dv_theta: Array, dt: float, length: Array, v_theta_max: float
+    theta: Array,
+    v_theta: Array,
+    dv_theta: Array,
+    dt: float,
+    length: Array,
+    v_theta_max: float | Array,
 ) -> tuple[Array, Array]:
     """Advance the progress states by one time step (Eq. 16).
 
