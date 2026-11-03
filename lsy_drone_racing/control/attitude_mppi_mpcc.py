@@ -36,20 +36,29 @@ if TYPE_CHECKING:
 
     from lsy_drone_racing.control.mpcc.path import ArcLengthPath
 
-V_THETA_MAX = 6.0  # Maximum progress speed in m/s
+V_THETA_MAX = 8.0  # Maximum progress speed in m/s
+# Progress speed cap where the path comes within SLOW_RADIUS (horizontally, in meters) of a gate
+# whose true pose is not revealed yet. The pose is revealed at 0.7 m, and arriving slowly leaves
+# time to correct towards it.
+V_THETA_SLOW = 1.5
+SLOW_RADIUS = 1.0
 DV_THETA_MAX = 10.0  # Maximum magnitude of the progress acceleration in m/s^2
 PROGRESS_WINDOW = (0.2, 0.2)  # (behind, ahead) in meters around the predicted progress to search
 
 COLLISION_CONSTANTS = {
-    "gate_tolerance": 0.05,  # Acceptable deviation in meters from the gate's center
+    # Acceptable deviation in meters from the gate's center: the inner half-width (0.2 m) minus the
+    # drone's radius. A stricter value also penalises the planned path, which stalls the drone.
+    "gate_tolerance": 0.1,
     "gate_slab": 0.1,  # Half-thickness in meters around a gate's plane in which the gate is checked
     "gate_frame_limit": 0.45,  # Offset in meters from the gate's center beyond the frame
-    "obstacle_radius": 0.2,  # Radius in meters of the penalty tube around an obstacle
+    # Radius in meters of the penalty tube around an obstacle, inside the planner's obstacle
+    # clearance so that following the path is not penalised
+    "obstacle_radius": 0.13,
 }
 
 COLLISION_WEIGHTS = {
-    "gate_weight": 4.0,  # Weight for gate pass / collision / miss
-    "obstacle_weight": 3.0,  # Weight for coming close to an obstacle
+    "gate_weight": 6.0,  # Weight for gate pass / collision / miss
+    "obstacle_weight": 200.0,  # Weight for coming close to an obstacle
 }
 
 
@@ -98,15 +107,26 @@ def collision_cost(pos: Array, gates: Array, obstacles_pos: Array) -> Array:
 
 
 def progress_rollout(
-    theta0: Array, v_theta0: Array, dv_theta: Array, length: Array, dt: float
+    theta0: Array,
+    v_theta0: Array,
+    dv_theta: Array,
+    path: ArcLengthPath,
+    gates: Array,
+    gates_revealed: Array,
+    dt: float,
 ) -> tuple[Array, Array, Array]:
     """Simulate the progress states for a sequence of progress accelerations.
+
+    The progress speed is capped at V_THETA_SLOW where the path is near an unrevealed gate, and at
+    V_THETA_MAX elsewhere.
 
     Args:
         theta0: Initial progress in meters.
         v_theta0: Initial progress speed in m/s.
         dv_theta: Progress accelerations with shape (H,).
-        length: Path length in meters.
+        path: The path to follow.
+        gates: Position and normal vector of every gate with shape (n_gates, 6).
+        gates_revealed: Whether each gate's true pose is known, with shape (n_gates,).
         dt: Integration step in seconds.
 
     Returns:
@@ -116,7 +136,11 @@ def progress_rollout(
     """
 
     def step_fn(carry: tuple[Array, Array], dv: Array) -> tuple[tuple, tuple]:
-        theta_next, v_theta_next = progress_step(*carry, dv, dt, length, V_THETA_MAX)
+        path_xy = path_lookup(path, carry[0])[0][:2]
+        gate_xy_distance = jnp.linalg.norm(gates[:, :2] - path_xy, axis=-1)
+        near_unrevealed = jnp.any((gate_xy_distance < SLOW_RADIUS) & ~gates_revealed)
+        v_theta_max = jnp.where(near_unrevealed, V_THETA_SLOW, V_THETA_MAX)
+        theta_next, v_theta_next = progress_step(*carry, dv, dt, path.length, v_theta_max)
         return (theta_next, v_theta_next), (theta_next, v_theta_next)
 
     _, (theta, v_theta) = jax.lax.scan(step_fn, (theta0, v_theta0), dv_theta)
@@ -139,6 +163,7 @@ def mppi_mpcc_update(
     u_prev: Array,
     path: ArcLengthPath,
     gates: Array,
+    gates_revealed: Array,
     obstacles_pos: Array,
     weights: dict,
     params: dict,
@@ -164,6 +189,7 @@ def mppi_mpcc_update(
         u_prev: Previous command with shape (4,).
         path: The path to follow.
         gates: Position and normal vector of every gate with shape (n_gates, 6).
+        gates_revealed: Whether each gate's true pose is known, with shape (n_gates,).
         obstacles_pos: Obstacle positions with shape (n_obstacles, 3).
         weights: MPCC cost weights, see `MPCC_WEIGHTS`.
         params: Drone parameters.
@@ -200,9 +226,9 @@ def mppi_mpcc_update(
     sampled_dv_theta = jnp.clip(sampled_dv_theta, -DV_THETA_MAX, DV_THETA_MAX)
 
     rollouts = jax.vmap(rollout, in_axes=(None, 0, None, None))(x0, sampled_actions, params, dt)
-    theta, v_theta, dv_theta = jax.vmap(progress_rollout, in_axes=(None, None, 0, None, None))(
-        theta0, v_theta0, sampled_dv_theta, path.length, dt
-    )
+    theta, v_theta, dv_theta = jax.vmap(
+        progress_rollout, in_axes=(None, None, 0, None, None, None, None)
+    )(theta0, v_theta0, sampled_dv_theta, path, gates, gates_revealed, dt)
 
     def cost_fn(X: Array, U: Array, theta: Array, v_theta: Array, dv_theta: Array) -> Array:
         contouring = mpcc_cost(X, U, u_prev, theta, v_theta, dv_theta, path, gates[:, :3], weights)
@@ -217,7 +243,9 @@ def mppi_mpcc_update(
     U_new = jnp.sum(sample_weights[:, None, None] * sampled_actions, axis=0)
     # Average the effective accelerations, so the plan matches what the progress states did
     dv_theta_new = jnp.sum(sample_weights[:, None] * dv_theta, axis=0)
-    theta_plan, v_theta_plan, _ = progress_rollout(theta0, v_theta0, dv_theta_new, path.length, dt)
+    theta_plan, v_theta_plan, _ = progress_rollout(
+        theta0, v_theta0, dv_theta_new, path, gates, gates_revealed, dt
+    )
 
     best = jax.lax.top_k(-costs, N_VIS_BEST)[1]
     strided = jnp.arange(N_VIS_RANDOM) * (n_samples // N_VIS_RANDOM)
@@ -304,6 +332,7 @@ class AttitudeMPPIMPCC(Controller):
             self._u_prev,
             self._path,
             jnp.asarray(np.hstack((obs["gates_pos"], gates_normal))),
+            jnp.asarray(obs["gates_visited"]),
             jnp.asarray(obs["obstacles_pos"]),
             MPCC_WEIGHTS,
             self._params,
