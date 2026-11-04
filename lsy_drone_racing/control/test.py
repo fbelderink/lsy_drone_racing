@@ -1,9 +1,10 @@
 import jax
+import jax.numpy as jnp
 from crazyflow.dynamics import Dynamics, load_params
 from crazyflow.dynamics.so_rpy.dynamics import dynamics_euler
-import jax.numpy as jnp
 
 params = load_params(Dynamics.so_rpy, "cf21B_500")
+
 
 def f(t: float):
     return dynamics_euler(
@@ -20,6 +21,8 @@ def f(t: float):
         rpy_coef=params["rpy_coef"],
         rpy_rates_coef=params["rpy_rates_coef"],
     )
+
+
 f_jit = jax.jit(f)
 
 f_batched = jax.vmap(f_jit, in_axes=(0,), out_axes=(0, 0, 0, 0))

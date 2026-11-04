@@ -26,7 +26,6 @@ from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.mid_level.mid_level_controller import MidLevelController
-from lsy_drone_racing.control.planner.reference import Reference
 from lsy_drone_racing.control.planner.splines import SplinePlanner
 
 if TYPE_CHECKING:
@@ -49,20 +48,22 @@ def dynamics_step(x: Array, u: Array, params: dict, dt: float) -> Array:
     """
     # TODO Check if RK4 integration is necessary, or if Euler is sufficient for the small dt.
     pos, rpy, vel, drpy = jnp.split(x, 4)
-    x_dot = jnp.concatenate(dynamics_euler(
-        pos=pos,
-        rpy=rpy,
-        vel=vel,
-        rpy_rates=drpy,
-        cmd=u,
-        mass=params["mass"],
-        gravity_vec=params["gravity_vec"],
-        acc_coef=params["acc_coef"],
-        cmd_f_coef=params["cmd_f_coef"],
-        cmd_rpy_coef=params["cmd_rpy_coef"],
-        rpy_coef=params["rpy_coef"],
-        rpy_rates_coef=params["rpy_rates_coef"]
-    ))
+    x_dot = jnp.concatenate(
+        dynamics_euler(
+            pos=pos,
+            rpy=rpy,
+            vel=vel,
+            rpy_rates=drpy,
+            cmd=u,
+            mass=params["mass"],
+            gravity_vec=params["gravity_vec"],
+            acc_coef=params["acc_coef"],
+            cmd_f_coef=params["cmd_f_coef"],
+            cmd_rpy_coef=params["cmd_rpy_coef"],
+            rpy_coef=params["rpy_coef"],
+            rpy_rates_coef=params["rpy_rates_coef"],
+        )
+    )
 
     # Euler integration step
     x_next = x + dt * x_dot
@@ -113,7 +114,7 @@ COST_WEIGHTS = {
 
 MLC_CONSTANTS = {
     "v_max": 6.0,
-    "a_long_max": 8.0, # most important in the current setup for speed
+    "a_long_max": 8.0,  # most important in the current setup for speed
     "a_lat_max": 5.0,
     "a_brake_max": 7.0,
     "v_gate_max": 1.0,  # speed cap at a gate's center
@@ -122,13 +123,7 @@ MLC_CONSTANTS = {
 
 
 def trajectory_cost(
-        X: Array,
-        U: Array,
-        u_prev: Array,
-        ref: Array,
-        gates: Array,
-        obstacles_pos: Array,
-        sigma: Array,
+    X: Array, U: Array, u_prev: Array, ref: Array, gates: Array, obstacles_pos: Array, sigma: Array
 ) -> Array:
     """Compute the cost of a single rollout.
 
@@ -155,8 +150,12 @@ def trajectory_cost(
     deviation_cost = jnp.sum(pos_error_per_step)
 
     # Cost for control smoothness
-    U_including_prev = jnp.vstack((u_prev, U))  # Include previous control input for smoothness calculation
-    control_diff = jnp.diff(U_including_prev, axis=0)  # Compute differences between consecutive control inputs
+    U_including_prev = jnp.vstack(
+        (u_prev, U)
+    )  # Include previous control input for smoothness calculation
+    control_diff = jnp.diff(
+        U_including_prev, axis=0
+    )  # Compute differences between consecutive control inputs
     control_diff /= COST_CONSTANTS["smoothness_tolerance"] * jnp.maximum(1e-6, sigma)
     smoothness_cost = jnp.sum(jnp.linalg.norm(control_diff, axis=1))
 
@@ -171,29 +170,34 @@ def trajectory_cost(
     # use maxnorm(to not punish corners) of distance to gate center along gate plane primary axes
     # primary axes are always vertical axis and the cross between normal and vertical axis
     vertical_distance = gate_offset[..., 2]
-    horizontal_distance = jnp.sum(gate_offset * jnp.cross(gate_normal, jnp.array([0, 0, 1]))[None, :, :], axis=-1)
+    horizontal_distance = jnp.sum(
+        gate_offset * jnp.cross(gate_normal, jnp.array([0, 0, 1]))[None, :, :], axis=-1
+    )
     gate_plane_max_distance = jnp.maximum(jnp.abs(vertical_distance), jnp.abs(horizontal_distance))
     # states beside the frame, outside of its outer edge, are free
     frame_mask = near_gate_mask & (gate_plane_max_distance < COST_CONSTANTS["gate_frame_limit"])
 
     # cost function based on distance to gate center
-    distance_further_than_tolerance = jnp.maximum(gate_plane_max_distance / COST_CONSTANTS["gate_tolerance"] - 1, 0)
-    gate_cost = jnp.sum(jnp.where(frame_mask, distance_further_than_tolerance ** 2, 0))
-    
+    distance_further_than_tolerance = jnp.maximum(
+        gate_plane_max_distance / COST_CONSTANTS["gate_tolerance"] - 1, 0
+    )
+    gate_cost = jnp.sum(jnp.where(frame_mask, distance_further_than_tolerance**2, 0))
+
     # Cost for coming close to an obstacle: tube around each pole, checked in the x-y plane
     obstacle_xy_distance = jnp.linalg.norm(pos[:, None, :2] - obstacles_pos[None, :, :2], axis=-1)
     # 0 outside the tube radius, rising to 1 at the pole's axis
     tube_penetration = jnp.maximum(1 - obstacle_xy_distance / COST_CONSTANTS["obstacle_radius"], 0)
-    obstacle_cost = jnp.sum(tube_penetration ** 2)
+    obstacle_cost = jnp.sum(tube_penetration**2)
 
     total_cost = (
-            COST_WEIGHTS["deviation_weight"] * deviation_cost
-            + COST_WEIGHTS["smoothness_weight"] * smoothness_cost
-            + COST_WEIGHTS["gate_weight"] * gate_cost
-            + COST_WEIGHTS["obstacle_weight"] * obstacle_cost
+        COST_WEIGHTS["deviation_weight"] * deviation_cost
+        + COST_WEIGHTS["smoothness_weight"] * smoothness_cost
+        + COST_WEIGHTS["gate_weight"] * gate_cost
+        + COST_WEIGHTS["obstacle_weight"] * obstacle_cost
     )  # Add other cost components if needed
 
     return total_cost
+
 
 def adaptive_lambda(costs: Array, target_ess: float, n_iter: int = 30) -> Array:
     """Find the softmin temperature at which the weights reach a target effective sample size.
@@ -213,7 +217,7 @@ def adaptive_lambda(costs: Array, target_ess: float, n_iter: int = 30) -> Array:
 
     def ess(log_lam):
         weights = jax.nn.softmax(-costs / jnp.exp(log_lam))
-        return 1 / jnp.sum(weights ** 2)
+        return 1 / jnp.sum(weights**2)
 
     def bisect(_, bounds):
         lo, hi = bounds
@@ -237,18 +241,18 @@ def speed_to_rgba(speed: NDArray, alpha: float = 1.0) -> NDArray:
 
 
 def mppi_update(
-        key: Array,
-        x0: Array,
-        U_nom: Array,
-        u_prev: Array,
-        ref: Array,
-        gates: Array,
-        obstacles_pos: Array,
-        params: dict,
-        dt: float,
-        n_samples: int,
-        sigma: Array,
-        target_ess: float,
+    key: Array,
+    x0: Array,
+    U_nom: Array,
+    u_prev: Array,
+    ref: Array,
+    gates: Array,
+    obstacles_pos: Array,
+    params: dict,
+    dt: float,
+    n_samples: int,
+    sigma: Array,
+    target_ess: float,
 ) -> tuple[Array, Array, Array, Array, Array, Array]:
     """Perform one MPPI iteration.
 
@@ -289,7 +293,7 @@ def mppi_update(
     sampled_actions = jnp.clip(
         sampled_actions,
         jnp.array([-1.0, -1.0, -1.0, 4 * params["thrust_min"]]),
-        jnp.array([1.0, 1.0, 1.0, 4 * params["thrust_max"]])
+        jnp.array([1.0, 1.0, 1.0, 4 * params["thrust_max"]]),
     )
 
     # define batch functions
@@ -299,21 +303,10 @@ def mppi_update(
     cost_jit = jax.jit(trajectory_cost)
     trajectory_cost_for_batch = jax.vmap(cost_jit, in_axes=(0, 0, None, None, None, None, None))
 
-    rollouts = rollout_batch_of_trajectories(
-        x0,
-        sampled_actions,
-        params,
-        dt,
-    )
+    rollouts = rollout_batch_of_trajectories(x0, sampled_actions, params, dt)
 
     costs = trajectory_cost_for_batch(
-        rollouts,
-        sampled_actions,
-        u_prev,
-        ref,
-        gates,
-        obstacles_pos,
-        sigma,
+        rollouts, sampled_actions, u_prev, ref, gates, obstacles_pos, sigma
     )
 
     # weighting the runs by costs
@@ -321,7 +314,7 @@ def mppi_update(
     weights = jax.nn.softmax(-costs / lam)
 
     # calculate effective sample size (ESS) for debugging and logging
-    ess = 1 / jnp.sum(weights ** 2)
+    ess = 1 / jnp.sum(weights**2)
 
     U_new = jnp.sum(weights[:, None, None] * sampled_actions, axis=0)
 
@@ -338,7 +331,7 @@ def mppi_update(
 
 
 def build_reference(
-        waypoints: NDArray, t_total: float, freq: float, n_extend: int = 0
+    waypoints: NDArray, t_total: float, freq: float, n_extend: int = 0
 ) -> np.ndarray:
     """Create a time-indexed reference from a cubic spline through the waypoints.
 
@@ -365,6 +358,7 @@ def build_reference(
     extension = np.hstack((ref[-1, :3] + steps * ref[-1, 3:], np.tile(ref[-1, 3:], (n_extend, 1))))
     return np.vstack((ref, extension))
 
+
 class AttitudeMPPI(Controller):
     """Sampling-based MPC using the collective thrust and attitude interface."""
 
@@ -381,8 +375,12 @@ class AttitudeMPPI(Controller):
         self._dt = 1 / self._freq
         self._horizon = 30  # planning steps, 0.5 s at 50 Hz
         self._n_samples = 1024  # sampled control sequences per step
-        self._sigma = jnp.array([0.15, 0.15, 0.0, 0.05]) * 2.0  # noise std: roll, pitch, yaw, thrust
-        self._target_ess = 0.05  # fraction of samples that should effectively contribute to the update
+        self._sigma = (
+            jnp.array([0.15, 0.15, 0.0, 0.05]) * 2.0
+        )  # noise std: roll, pitch, yaw, thrust
+        self._target_ess = (
+            0.05  # fraction of samples that should effectively contribute to the update
+        )
         self._lam = float("nan")  # softmin temperature, adapted every step to reach the target ESS
         self._params = load_params(Dynamics.so_rpy, config.sim.drone)
         # Hover command, inverted from force = acc_coef + cmd_f_coef * cmd
@@ -390,7 +388,7 @@ class AttitudeMPPI(Controller):
             (self._params["mass"] * -self._params["gravity_vec"][-1] - self._params["acc_coef"])
             / self._params["cmd_f_coef"]
         )
-        
+
         self._mlc = MidLevelController(
             SplinePlanner(obs, config),
             v_max=MLC_CONSTANTS["v_max"],
@@ -401,7 +399,6 @@ class AttitudeMPPI(Controller):
             gate_window=MLC_CONSTANTS["gate_window"],
         )
 
-
         # n_samples fixes an array shape, so it must be static for jit
         self._update = jax.jit(mppi_update, static_argnames=("n_samples",))
         self._key = jax.random.key(0)
@@ -411,7 +408,7 @@ class AttitudeMPPI(Controller):
         self._ess = float("nan")
         self._vis = None  # (rollout positions, rollout weights, mean path), set in compute_control
         self._finished = False
-        
+
         self._ref = self._mlc.get_trajectory(obs, self._horizon, self._dt)
 
         # Warm-up call so the jit compilation happens here and not in the first control step
@@ -438,7 +435,7 @@ class AttitudeMPPI(Controller):
         return jnp.asarray(np.concatenate((obs["pos"], rpy, obs["vel"], drpy)))
 
     def compute_control(
-            self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
+        self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
         """Compute the next roll, pitch, yaw and collective thrust command.
 
@@ -449,12 +446,11 @@ class AttitudeMPPI(Controller):
         Returns:
             The command [roll, pitch, yaw, thrust] as a numpy array.
         """
-        
         if self._mlc._current_progress >= self._mlc._planner._current_reference.length:
             self._finished = True
-        
+
         self._ref = self._mlc.get_trajectory(obs, self._horizon, self._dt)
-        
+
         # Fresh noise every step: split the key, keep one half and use the other
         self._key, subkey = jax.random.split(self._key)
         U_new, ess, lam, vis_pos, vis_weights, mean_path = self._update(
@@ -516,8 +512,11 @@ class AttitudeMPPI(Controller):
         w = np.sqrt(vis_weights / vis_weights.max())
         for pos, wi in zip(vis_pos, w):
             draw_line(
-                sim, pos[::2], rgba=(0.1, 1.0, 0.1, 0.1 + 0.9 * wi),
-                start_size=1.0 + 3.0 * wi, end_size=1.0 + 3.0 * wi,
+                sim,
+                pos[::2],
+                rgba=(0.1, 1.0, 0.1, 0.1 + 0.9 * wi),
+                start_size=1.0 + 3.0 * wi,
+                end_size=1.0 + 3.0 * wi,
             )
         # Chosen mean action sequence, drawn last so it is on top
         draw_line(sim, mean_path, rgba=(1.0, 0.0, 1.0, 1.0), start_size=4.5, end_size=4.5)
