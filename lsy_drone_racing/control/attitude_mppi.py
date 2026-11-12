@@ -1,13 +1,14 @@
 """Sampling-based MPC (MPPI) for drone racing using the collective thrust and attitude interface.
 
-The controller plans over the fitted second-order `so_rpy` dynamics model. At each step it samples
-perturbed control sequences around a nominal sequence, simulates them in parallel, and updates the
-nominal sequence with a cost-weighted average of the perturbations.
+The controller plans over the fitted second-order `so_rpy_rotor_drag` dynamics model, i.e. `so_rpy`
+with a first-order lag on the collective thrust and a linear body-frame drag. At each step it
+samples perturbed control sequences around a nominal sequence, simulates them in parallel, and
+updates the nominal sequence with a cost-weighted average of the perturbations.
 
-State and input conventions follow `attitude_mpc.py`:
+State and input conventions follow `attitude_mpc.py`, with the thrust state appended:
 
-    x = [pos(3), rpy(3), vel(3), drpy(3)]
-    u = [roll, pitch, yaw, thrust]  (thrust is the total collective thrust in N)
+    x = [pos(3), rpy(3), vel(3), drpy(3), thrust(1)]  (thrust is the lagged collective thrust in N)
+    u = [roll, pitch, yaw, thrust]  (thrust is the commanded total collective thrust in N)
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from crazyflow.dynamics import Dynamics, load_params
-from crazyflow.dynamics.so_rpy.dynamics import dynamics_euler
+from crazyflow.dynamics.so_rpy_rotor_drag.dynamics import dynamics_euler
 from crazyflow.dynamics.utils.rotation import ang_vel2rpy_rates
 from crazyflow.sim.visualize import draw_line, draw_points
 from scipy.interpolate import CubicSpline
@@ -35,19 +36,19 @@ if TYPE_CHECKING:
 
 
 def dynamics_step(x: Array, u: Array, params: dict, dt: float) -> Array:
-    """Advance the so_rpy model by one time step.
+    """Advance the so_rpy_rotor_drag model by one time step.
 
     Args:
-        x: State [pos, rpy, vel, drpy] with shape (12,).
+        x: State [pos, rpy, vel, drpy, thrust] with shape (13,).
         u: Input [roll, pitch, yaw, thrust] with shape (4,).
         params: Drone parameters as returned by `crazyflow.dynamics.load_params`.
         dt: Integration step in seconds.
 
     Returns:
-        The next state with shape (12,).
+        The next state with shape (13,).
     """
     # TODO Check if RK4 integration is necessary, or if Euler is sufficient for the small dt.
-    pos, rpy, vel, drpy = jnp.split(x, 4)
+    pos, rpy, vel, drpy, thrust = jnp.split(x, [3, 6, 9, 12])
     x_dot = jnp.concatenate(
         dynamics_euler(
             pos=pos,
@@ -55,13 +56,16 @@ def dynamics_step(x: Array, u: Array, params: dict, dt: float) -> Array:
             vel=vel,
             rpy_rates=drpy,
             cmd=u,
+            rotor_vel=thrust,  # the model stores the lagged thrust in its rotor_vel state
             mass=params["mass"],
             gravity_vec=params["gravity_vec"],
+            thrust_dyn_coef=params["thrust_dyn_coef"],
             acc_coef=params["acc_coef"],
             cmd_f_coef=params["cmd_f_coef"],
             cmd_rpy_coef=params["cmd_rpy_coef"],
             rpy_coef=params["rpy_coef"],
             rpy_rates_coef=params["rpy_rates_coef"],
+            drag_matrix=params["drag_matrix"],
         )
     )
 
@@ -75,13 +79,13 @@ def rollout(x0: Array, U: Array, params: dict, dt: float) -> Array:
     """Simulate a control sequence starting from x0.
 
     Args:
-        x0: Initial state with shape (12,).
+        x0: Initial state with shape (13,).
         U: Control sequence with shape (H, 4).
         params: Drone parameters.
         dt: Integration step in seconds.
 
     Returns:
-        The state trajectory with shape (H + 1, 12), including x0.
+        The state trajectory with shape (H + 1, 13), including x0.
     """
 
     # Define a step function for the scan operation
@@ -131,7 +135,7 @@ def trajectory_cost(
     """Compute the cost of a single rollout.
 
     Args:
-        X: State trajectory with shape (H + 1, 12).
+        X: State trajectory with shape (H + 1, 13).
         U: Control sequence with shape (H, 4).
         u_prev: Previous control input with shape (4,).
         ref: Reference positions and tangential velocities with shape (H + 1, 6).
@@ -289,7 +293,7 @@ def mppi_update(
 
     Args:
         key: JAX PRNG key.
-        x0: Current state with shape (12,).
+        x0: Current state with shape (13,).
         U_nom: Nominal control sequence with shape (H, 4).
         u_prev: Previous control sequence with shape (4,).
         ref: Reference positions with shape (H + 1, 3).
@@ -409,7 +413,7 @@ class AttitudeMPPI(Controller):
             0.05  # fraction of samples that should effectively contribute to the update
         )
         self._lam = float("nan")  # softmin temperature, adapted every step to reach the target ESS
-        self._params = load_params(Dynamics.so_rpy, config.sim.drone)
+        self._params = load_params(Dynamics.so_rpy_rotor_drag, config.sim.drone)
         # Hover command, inverted from force = acc_coef + cmd_f_coef * cmd
         self._hover_thrust = float(
             (self._params["mass"] * -self._params["gravity_vec"][-1] - self._params["acc_coef"])
@@ -433,6 +437,8 @@ class AttitudeMPPI(Controller):
         # Warm start: hold hover thrust with level attitude
         self._U_nom = jnp.tile(jnp.array([0.0, 0.0, 0.0, self._hover_thrust]), (self._horizon, 1))
         self._u_prev = self._U_nom[0]
+        # The thrust is not observed, so it is estimated by passing the commands through the lag
+        self._thrust = 0.0
         self._ess = float("nan")
         self._vis = None  # (rollout positions, rollout weights, mean path), set in compute_control
         self._finished = False
@@ -460,11 +466,13 @@ class AttitudeMPPI(Controller):
         )
 
     def _state(self, obs: dict[str, NDArray[np.floating]]) -> Array:
-        """Convert an observation to the planning state [pos, rpy, vel, drpy]."""
+        """Convert an observation to the planning state [pos, rpy, vel, drpy, thrust]."""
         rpy = R.from_quat(obs["quat"]).as_euler("xyz")
         # The model uses roll/pitch/yaw rates, the observation gives the body angular velocity
         drpy = ang_vel2rpy_rates(obs["quat"], obs["ang_vel"])
-        return jnp.asarray(np.concatenate((obs["pos"], rpy, obs["vel"], drpy)))
+        return jnp.asarray(
+            np.concatenate((obs["pos"], rpy, obs["vel"], drpy, [self._thrust])), dtype=jnp.float32
+        )
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
@@ -509,7 +517,11 @@ class AttitudeMPPI(Controller):
         # Shift by one step for the next call and repeat the last input to fill the end
         self._U_nom = jnp.concatenate((U_new[1:], U_new[-1:]))
         # Only the first input is applied, the rest is re-planned at the next step
-        return np.asarray(U_new[0], dtype=np.float32)
+        action = np.asarray(U_new[0], dtype=np.float32)
+        # Propagate the thrust estimate with the same first-order lag the model uses
+        thrust_dyn_coef = float(self._params["thrust_dyn_coef"])
+        self._thrust += thrust_dyn_coef * (action[3] - self._thrust) * self._dt
+        return action
 
     def step_callback(
         self,
@@ -649,6 +661,7 @@ class AttitudeMPPI(Controller):
         self._obstacle_now = None
         self._U_nom = jnp.tile(jnp.array([0.0, 0.0, 0.0, self._hover_thrust]), (self._horizon, 1))
         self._u_prev = self._U_nom[0]
+        self._thrust = 0.0
 
     def _get_gates_pos_and_normal(self, obs: dict[str, NDArray[np.floating]]) -> Array:
         """Return the position and the normal vector of every gate with shape (n_gates, 6)."""
