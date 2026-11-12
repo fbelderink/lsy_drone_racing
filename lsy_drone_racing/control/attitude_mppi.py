@@ -21,7 +21,7 @@ import numpy as np
 from crazyflow.dynamics import Dynamics, load_params
 from crazyflow.dynamics.so_rpy_rotor_drag.dynamics import dynamics_euler
 from crazyflow.dynamics.utils.rotation import ang_vel2rpy_rates
-from crazyflow.sim.visualize import draw_line, draw_points
+from crazyflow.sim.visualize import draw_line
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 
@@ -259,8 +259,12 @@ def circle_outline(center_xy: NDArray, z: float, radius: float, n: int = 32) -> 
     """Return a closed horizontal circle around `center_xy` at height `z`, shape (n + 1, 3)."""
     angle = np.linspace(0, 2 * np.pi, n + 1)
     return np.stack(
-        (center_xy[0] + radius * np.cos(angle), center_xy[1] + radius * np.sin(angle),
-         np.full(n + 1, z)), axis=-1,
+        (
+            center_xy[0] + radius * np.cos(angle),
+            center_xy[1] + radius * np.sin(angle),
+            np.full(n + 1, z),
+        ),
+        axis=-1,
     )
 
 
@@ -541,6 +545,10 @@ class AttitudeMPPI(Controller):
 
     def render_callback(self, sim: Sim):
         """Draw the reference by speed, the sampled rollouts by weight and the mean action path."""
+        # Reference path from high level planner
+        ref_path, _ = self._mlc._planner._current_reference.sample_densely(num_samples=200)
+        draw_line(sim, ref_path, rgba=(0.0, 1.0, 0.0, 1.0))
+
         # Local reference trajectory handed to MPPI, colored by its speed
         ref_pos = self._ref[:, :3]
         colors = speed_to_rgba(np.linalg.norm(self._ref[:, 3:6], axis=1)[:-1])
@@ -550,6 +558,7 @@ class AttitudeMPPI(Controller):
         self._draw_gate_perception(sim)
         self._draw_obstacle_perception(sim)
 
+        """
         if self._vis is None:
             return
         # Reference point the drone should be tracking right now
@@ -570,6 +579,7 @@ class AttitudeMPPI(Controller):
         # Chosen mean action sequence, drawn last so it is on top
         draw_line(sim, mean_path, rgba=(1.0, 0.0, 1.0, 1.0), start_size=4.5, end_size=4.5)
         draw_points(sim, mean_path, rgba=(1.0, 0.0, 1.0, 1.0), size=0.01)
+        """
 
     def _track_gate_perception(self, obs: dict[str, NDArray[np.floating]]):
         """Store the previously perceived pose of every gate whose observed pose just changed."""
@@ -638,20 +648,29 @@ class AttitudeMPPI(Controller):
                 pole = np.array([[*old_pos[:2], 0.0], old_pos])
                 draw_line(sim, pole, rgba=orange, start_size=1.5, end_size=1.5)
                 draw_line(
-                    sim, circle_outline(old_pos[:2], z_tube, radius), rgba=orange,
-                    start_size=1.5, end_size=1.5,
+                    sim,
+                    circle_outline(old_pos[:2], z_tube, radius),
+                    rgba=orange,
+                    start_size=1.5,
+                    end_size=1.5,
                 )
                 draw_line(
-                    sim, np.stack(([*old_pos[:2], z_tube], [*pos[:2], z_tube])), rgba=orange,
-                    start_size=1.5, end_size=1.5,
+                    sim,
+                    np.stack(([*old_pos[:2], z_tube], [*pos[:2], z_tube])),
+                    rgba=orange,
+                    start_size=1.5,
+                    end_size=1.5,
                 )
             # Current perception: the pole and the tube radius the obstacle cost penalizes
             draw_line(
                 sim, np.array([[*pos[:2], 0.0], pos]), rgba=cyan, start_size=4.0, end_size=4.0
             )
             draw_line(
-                sim, circle_outline(pos[:2], z_tube, radius), rgba=cyan,
-                start_size=2.0, end_size=2.0,
+                sim,
+                circle_outline(pos[:2], z_tube, radius),
+                rgba=cyan,
+                start_size=2.0,
+                end_size=2.0,
             )
 
     def episode_callback(self):

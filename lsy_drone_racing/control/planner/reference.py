@@ -73,8 +73,9 @@ class Reference:
         )  # (K, 3 derivs, 3 dims)
         return curve, u
 
-    def sample_densely(self):
-        u = np.linspace(0, self.length, int(self.length / self.ds) + 1)
+    def sample_densely(self, num_samples: int = None):
+        num_samples = num_samples if num_samples else int(self.length / self.ds) + 1
+        u = np.linspace(0, self.length, num_samples)
         return self._sparse_curve(u), u
 
     def update(self, new_knots, new_s, new_tangents=None, new_accs=None, min_spacing=0.3):
