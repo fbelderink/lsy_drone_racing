@@ -46,13 +46,9 @@ class SplinePlanner:
     def plan(self, obs: ObservationDict) -> Reference:
 
         if self._current_reference is None:
-            # initial path
-            if not self.is_track_randomized:
-                self._current_reference = Reference.default_reference(obs)
-            else:
-                self._current_reference = Reference(
-                    *self.find_waypoints(obs)
-                )  # compute waypoints from gate positions
+            self._current_reference = Reference(
+                *self.find_waypoints(obs)
+            )  # compute waypoints from gate positions
 
             return self._current_reference
 
