@@ -1,9 +1,21 @@
 """MPPI variants for `scripts/bench_mppi.py`.
 
 Each variant maps to overrides of `DEFAULT_PARAMS` in `lsy_drone_racing/control/attitude_mppi.py`.
+All variants except `default` are defined relative to the original defaults (`OLD_DEFAULTS`), so
+their results stay reproducible after the defaults were changed to the best configuration.
 The special keys `cost_constants`, `cost_weights` and `mlc` override entries of the controller's
 `COST_CONSTANTS`, `COST_WEIGHTS` and `MLC_CONSTANTS` dictionaries.
 """
+
+# The defaults before the roadmap work, applied below to every variant except `default`
+OLD_DEFAULTS = {
+    "integrator": "euler",
+    "include_nominal": False,
+    "discount_tau": 0.0,
+    "dist_alpha": 0.0,
+    "dist_axes": [1.0, 1.0, 1.0],
+}
+OLD_MLC = {"a_long_max": 8.0, "a_lat_max": 5.0, "a_brake_max": 7.0}
 
 # 10 x 0.02 s + 15 x 0.06 s = 1.1 s with exact discretization and crossing-based gate checks
 LONG = {
@@ -178,4 +190,28 @@ VARIANTS: dict[str, dict] = {
     "gpu_sb_lat10": {**SHORT_BEST, "mlc": LAT10},
     "gpu_sb_16k_lat10": {**SHORT_BEST, "n_samples": 16384, "mlc": LAT10},
     "gpu_sb_16k_lat8_vg25": {**SHORT_BEST, "n_samples": 16384, "mlc": {**LAT8, "v_gate_max": 2.5}},
+    # At speed the drone drifts wide and passes outside `gate_frame_limit`, where the gate cost is
+    # zero; the gate bonus rewards passing (it did not help at the default speed)
+    "sb_lat8_bonus": {**SHORT_BEST, "mlc": LAT8, "cost_mode": "hybrid", "cost_weights": BONUS_ONLY},
+    "sb_lat9_bonus": {
+        **SHORT_BEST,
+        "mlc": {**LAT8, "a_lat_max": 9.0},
+        "cost_mode": "hybrid",
+        "cost_weights": BONUS_ONLY,
+    },
+    "sb_lat10_bonus": {
+        **SHORT_BEST,
+        "mlc": LAT10,
+        "cost_mode": "hybrid",
+        "cost_weights": BONUS_ONLY,
+    },
 }
+
+
+def _on_old_defaults(v: dict) -> dict:
+    return {**OLD_DEFAULTS, **v, "mlc": {**OLD_MLC, **v.get("mlc", {})}}
+
+
+VARIANTS = {k: _on_old_defaults(v) for k, v in VARIANTS.items()}
+# The current defaults (`short_best` with a_lat 7, i.e. `sb_lat7_vg20`)
+VARIANTS["default"] = {}

@@ -260,24 +260,25 @@ DEFAULT_PARAMS = {
     # Sampling (roadmap item 1)
     "noise_beta": 0.0,  # AR(1) coefficient of temporally smoothed noise, 0 for white noise
     "truncated": False,  # truncated-normal sampling within the action limits instead of clipping
-    "include_nominal": False,  # always include the unperturbed nominal and a hover sequence
+    "include_nominal": True,  # always include the unperturbed nominal and a hover sequence
     "nan_guard": False,  # replace NaN or inf rollout costs with a large constant
     # Horizon (roadmap item 2): `horizon` steps of 1 / freq, then `n_coarse` steps of
     # `coarse_factor` / freq
     "n_coarse": 0,
     "coarse_factor": 3,
-    "integrator": "euler",  # "euler", "exact" or "rk4", see `dynamics_step`
+    "integrator": "exact",  # "euler", "exact" or "rk4", see `dynamics_step`
     "gate_mode": "slab",  # "slab", "crossing" or "both", see `trajectory_cost`
     "step_weighting": "dt",  # "dt": weight running costs by step length, "none": every knot alike
     # Time constant in seconds of an exponential discount of the running costs, 0 for none. The
     # spread of the rollouts grows with time, so undiscounted far-future costs dominate the cost
     # differences between samples and drown the near-term terms that decide the next gate
-    "discount_tau": 0.0,
+    "discount_tau": 0.3,
     # Disturbance estimate (roadmap item 3): low-pass filter of the gap between the observed and
     # the predicted velocity change, fed to the rollouts as a constant acceleration
-    "dist_alpha": 0.0,  # filter gain per control step in (0, 1], 0 disables the estimate
+    "dist_alpha": 0.05,  # filter gain per control step in (0, 1], 0 disables the estimate
     "dist_max": 3.0,  # limit of the estimate per axis in m/s^2
-    "dist_axes": [1.0, 1.0, 1.0],  # mask of the estimated axes (x, y, z)
+    # mask of the estimated axes (x, y, z); x and y add noise without a measurable bias
+    "dist_axes": [0.0, 0.0, 1.0],
     # Progress-based cost (roadmap item 4)
     "cost_mode": "tracking",  # "tracking", "contouring" or "hybrid", see `trajectory_cost`
     "path_window": 6.0,  # length in meters of the path window ahead of the current progress
@@ -290,9 +291,12 @@ DEFAULT_PARAMS = {
 
 MLC_CONSTANTS = {
     "v_max": 6.0,
-    "a_long_max": 8.0,  # most important in the current setup for speed
-    "a_lat_max": 5.0,
-    "a_brake_max": 7.0,
+    "a_long_max": 10.0,
+    # Lateral acceleration in curves. With the speed cap around unrevealed gates this sets the lap
+    # time (the inputs are not saturated). 7 gives -0.54 s at the same success rate as 5; from 9 on
+    # the drone overshoots turns and misses gates (see benchmarks/mppi/CHANGELOG.md)
+    "a_lat_max": 7.0,
+    "a_brake_max": 10.0,
     "v_gate_max": 2.0,  # speed cap within the plateau around a gate
     "gate_plateau": 0.9,  # progress in meters before and after a gate over which the cap stays flat (sensor range plus margin)
     "gate_window": 1.0,  # progress in meters before and after a gate over which the cap applies
