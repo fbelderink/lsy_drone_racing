@@ -63,4 +63,20 @@ VARIANTS: dict[str, dict] = {
     "long_dist05": {**LONG, "dist_alpha": 0.05},
     "long_dist05_hybrid": {**LONG, "dist_alpha": 0.05, "cost_mode": "hybrid"},
     "long_dist05_contour": {**LONG, "dist_alpha": 0.05, "cost_mode": "contouring"},
+    # Step 2b: isolate why the long horizon fails
+    "tail": {"n_coarse": 10, "coarse_factor": 3, "integrator": "exact", "gate_mode": "both"},
+    "tail_now": {
+        "n_coarse": 10,
+        "coarse_factor": 3,
+        "integrator": "exact",
+        "gate_mode": "both",
+        "step_weighting": "none",
+    },
+    "uniform50": {"horizon": 50, "integrator": "exact"},
+    "long_now": {**LONG, "step_weighting": "none"},
+    # Step 5: multi-modal MPPI and adaptive spread (same total of 1024 samples)
+    "modes2": {"n_modes": 2},
+    "modes4": {"n_modes": 4},
+    "sadapt": {"sigma_adapt": 0.1},
+    "modes4_sadapt": {"n_modes": 4, "sigma_adapt": 0.1},
 }

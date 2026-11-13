@@ -16,12 +16,14 @@ is printed. `--compare=baseline` prints paired differences against another varia
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
@@ -32,6 +34,9 @@ import fire
 import numpy as np
 
 ROOT = Path(__file__).parents[1]
+# Episodes per worker process before it is replaced. A worker's memory grows with every episode
+# (about 2 GB after a few dozen), so recycling keeps the total bounded
+TASKS_PER_WORKER = 10
 RESULTS = ROOT / "benchmarks" / "mppi" / "results"
 logger = logging.getLogger("bench_mppi")
 
@@ -39,10 +44,22 @@ logger = logging.getLogger("bench_mppi")
 def _worker_init(core_queue: Any):
     """Pin this worker to one physical core (and its SMT sibling) before JAX starts."""
     cores = core_queue.get()
+    # Workers are recycled (see `TASKS_PER_WORKER`), so a worker hands its core back on exit
+    atexit.register(core_queue.put, cores)
     try:
         os.sched_setaffinity(0, cores)
     except (AttributeError, OSError):
         pass
+    # Exit if the benchmark process dies, instead of running on as an orphan and holding memory
+    parent = os.getppid()
+
+    def watchdog():
+        while True:
+            time.sleep(5)
+            if os.getppid() != parent:
+                os._exit(1)
+
+    threading.Thread(target=watchdog, daemon=True).start()
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
     import warnings
 
@@ -214,6 +231,7 @@ def main(
     rerun: bool = True,
     show: bool = False,
     rngs: str | int | tuple = 0,
+    core_offset: int = 0,
 ):
     """Benchmark the given variants.
 
@@ -229,6 +247,7 @@ def main(
         show: Only print the stored results of the given variants.
         rngs: Comma-separated seeds of the MPPI sampling noise. Every (seed, rng) pair is one
             episode, so several rngs average over the sampling noise of the controller.
+        core_offset: First physical core to pin workers to, to run two benchmarks side by side.
     """
     sys.path.insert(0, str(ROOT / "benchmarks" / "mppi"))
     from variants import VARIANTS
@@ -250,8 +269,11 @@ def main(
         ctx = get_context("spawn")
         queue = ctx.Queue()
         for i in range(workers):
-            queue.put({i % n_cpu, i % n_cpu + n_cpu})
-        with ProcessPoolExecutor(workers, ctx, _worker_init, (queue,)) as pool:
+            core = (core_offset + i) % n_cpu
+            queue.put({core, core + n_cpu})
+        with ProcessPoolExecutor(
+            workers, ctx, _worker_init, (queue,), max_tasks_per_child=TASKS_PER_WORKER
+        ) as pool:
             for name in todo:
                 t0 = time.time()
                 futures = [

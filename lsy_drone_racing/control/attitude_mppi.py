@@ -268,6 +268,7 @@ DEFAULT_PARAMS = {
     "coarse_factor": 3,
     "integrator": "euler",  # "euler", "exact" or "rk4", see `dynamics_step`
     "gate_mode": "slab",  # "slab", "crossing" or "both", see `trajectory_cost`
+    "step_weighting": "dt",  # "dt": weight running costs by step length, "none": every knot alike
     # Disturbance estimate (roadmap item 3): low-pass filter of the gap between the observed and
     # the predicted velocity change, fed to the rollouts as a constant acceleration
     "dist_alpha": 0.0,  # filter gain per control step in (0, 1], 0 disables the estimate
@@ -278,6 +279,9 @@ DEFAULT_PARAMS = {
     "path_window": 6.0,  # length in meters of the path window ahead of the current progress
     "path_behind": 0.5,  # length in meters of the path window behind the current progress
     "path_ds": 0.05,  # spacing in meters of the path window's points
+    # Multi-modal MPPI and adaptive spread (roadmap item 5)
+    "n_modes": 1,  # parallel means, the samples are split evenly between them
+    "sigma_adapt": 0.0,  # gain of the adaptive noise spread per mode, 0 keeps sigma fixed
 }
 
 MLC_CONSTANTS = {
@@ -609,6 +613,8 @@ class MPPIOptions(NamedTuple):
     gate_mode: str = "slab"  # see `trajectory_cost`
     use_dist: bool = False  # add the estimated disturbance acceleration in the rollouts
     cost_mode: str = "tracking"  # see `trajectory_cost`
+    n_modes: int = 1  # number of parallel means, see `mppi_update_multimodal`
+    sigma_adapt: float = 0.0  # gain of the adaptive noise spread, 0 keeps sigma fixed
 
 
 def sample_actions(
@@ -664,7 +670,9 @@ def mppi_update(
     opts: MPPIOptions,
     dist_acc: Array | None = None,
     path: dict | None = None,
-) -> tuple[Array, Array, Array, Array, Array, Array]:
+    sigma_cost: Array | None = None,
+    return_extra: bool = False,
+) -> tuple[Array, Array, Array, Array, Array, Array] | dict:
     """Perform one MPPI iteration.
 
     Samples `n_samples` perturbed control sequences around `U_nom`, simulates and scores them, and
@@ -689,6 +697,10 @@ def mppi_update(
         opts: Static options (shapes and feature switches), see `MPPIOptions`.
         dist_acc: Estimated disturbance acceleration with shape (3,), used if `opts.use_dist`.
         path: Path window for the contouring cost, see `contouring_cost`.
+        sigma_cost: Noise scale that normalizes the smoothness cost, if it differs from the sampling
+            `sigma` (adaptive spread). Defaults to `sigma`.
+        return_extra: If True, return a dict that also holds the cost of the updated mean sequence
+            (`mean_cost`) and the weighted spread of the samples per channel (`noise_std`).
 
     Returns:
         - U_new: The updated nominal control sequence with shape (H, 4).
@@ -732,7 +744,7 @@ def mppi_update(
             ref,
             gates,
             obstacles_pos,
-            sigma,
+            sigma if sigma_cost is None else sigma_cost,
             cc,
             cw,
             w,
@@ -766,9 +778,22 @@ def mppi_update(
     vis_pos = rollouts[vis_idx, :, :3]
     vis_weights = weights[vis_idx]
     # Predicted path of the chosen mean action sequence
-    mean_path = rollout_one(U_new)[:, :3]
-
-    return U_new, ess, lam, vis_pos, vis_weights, mean_path
+    mean_rollout = rollout_one(U_new)
+    mean_path = mean_rollout[:, :3]
+    if not return_extra:
+        return U_new, ess, lam, vis_pos, vis_weights, mean_path
+    # Spread of the weighted samples per channel, for the adaptive noise
+    noise_std = jnp.sqrt(jnp.sum(weights[:, None] * jnp.mean((sampled_actions - U_nom) ** 2, 1), 0))
+    return {
+        "U_new": U_new,
+        "ess": ess,
+        "lam": lam,
+        "vis_pos": vis_pos,
+        "vis_weights": vis_weights,
+        "mean_path": mean_path,
+        "mean_cost": cost_one(mean_rollout, U_new),
+        "noise_std": noise_std,
+    }
 
 
 def build_reference(
@@ -835,7 +860,10 @@ class AttitudeMPPI(Controller):
         self._knot_idx = np.concatenate(([0], np.cumsum(factors)))
         self._grid = {
             "dts": jnp.asarray(self._dts),
-            "w": jnp.asarray(np.concatenate(([1], factors)), dtype=jnp.float32),
+            "w": jnp.asarray(
+                np.concatenate(([1], factors if p["step_weighting"] == "dt" else 1 + 0 * factors)),
+                dtype=jnp.float32,
+            ),
             "disc": None,  # set below, once the drone parameters are loaded
         }
         self._n_samples = int(p["n_samples"])  # sampled control sequences per step
@@ -846,6 +874,11 @@ class AttitudeMPPI(Controller):
         self._lam = float("nan")  # softmin temperature, adapted every step to reach the target ESS
         self._params = load_params(Dynamics.so_rpy_rotor_drag, config.sim.drone)
         self._grid["disc"] = discretize(self._params, self._dts)
+        # Constant inputs of the update live on the device, so they are not copied every step
+        self._params_dev = jax.device_put(
+            {k: jnp.asarray(v, dtype=jnp.float32) for k, v in self._params.items()}
+        )
+        self._grid = jax.device_put(self._grid)
         # Hover command, inverted from force = acc_coef + cmd_f_coef * cmd
         self._hover_thrust = float(
             (self._params["mass"] * -self._params["gravity_vec"][-1] - self._params["acc_coef"])
@@ -874,7 +907,15 @@ class AttitudeMPPI(Controller):
             gate_mode=str(p["gate_mode"]),
             use_dist=float(p["dist_alpha"]) > 0,
             cost_mode=str(p["cost_mode"]),
+            n_modes=int(p["n_modes"]),
+            sigma_adapt=float(p["sigma_adapt"]),
         )
+        # Several modes or an adaptive spread use the multi-modal update, which keeps one nominal
+        # sequence and one noise spread per mode
+        self._multimodal = self._opts.n_modes > 1 or self._opts.sigma_adapt > 0
+        self._update_mm = jax.jit(mppi_update_multimodal, static_argnames=("opts",))
+        self._shift_modes = jax.jit(jax.vmap(shift_controls, in_axes=(0, None, None)))
+        self._mode = 0  # index of the executed mode
         n_window = int(round((p["path_window"] + p["path_behind"]) / p["path_ds"])) + 1
         self._path_offsets = p["path_ds"] * np.arange(n_window) - p["path_behind"]
         # Disturbance estimate and the one-step prediction it is updated from
@@ -901,6 +942,8 @@ class AttitudeMPPI(Controller):
         # Warm start: hold hover thrust with level attitude
         self._U_nom = jnp.tile(jnp.array([0.0, 0.0, 0.0, self._hover_thrust]), (self._horizon, 1))
         self._u_prev = self._U_nom[0]
+        self._U_modes = jnp.tile(self._U_nom, (self._opts.n_modes, 1, 1))
+        self._sigma_modes = jnp.tile(self._sigma, (self._opts.n_modes, 1))
         # The thrust is not observed, so it is estimated by passing the commands through the lag
         self._thrust = 0.0
         self._ess = float("nan")
@@ -918,6 +961,28 @@ class AttitudeMPPI(Controller):
 
     def _run_update(self, key: Array, obs: dict[str, NDArray[np.floating]]) -> tuple:
         """Run one jitted MPPI update for the current observation and nominal sequence."""
+        if self._multimodal:
+            out = self._update_mm(
+                key,
+                self._state(obs),
+                self._U_modes,
+                self._sigma_modes,
+                self._u_prev,
+                self._ref,
+                self._get_gates_pos_and_normal(obs),
+                jnp.asarray(obs["obstacles_pos"]),
+                self._params_dev,
+                self._grid,
+                self._sigma,
+                self._target_ess,
+                self._cc,
+                self._cw,
+                opts=self._opts,
+                dist_acc=jnp.asarray(self._dist),
+                path=self._path_window(obs) if self._opts.cost_mode != "tracking" else None,
+            )
+            U_modes, sigma_modes, best, *rest = out
+            return (U_modes[best], *rest, (U_modes, sigma_modes, best))
         return self._update(
             key,
             self._state(obs),
@@ -926,7 +991,7 @@ class AttitudeMPPI(Controller):
             self._ref,
             self._get_gates_pos_and_normal(obs),
             jnp.asarray(obs["obstacles_pos"]),
-            self._params,
+            self._params_dev,
             self._grid,
             self._sigma,
             self._target_ess,
@@ -1006,9 +1071,12 @@ class AttitudeMPPI(Controller):
         # Fresh noise every step: split the key, keep one half and use the other
         self._key, subkey = jax.random.split(self._key)
         t_start = time.perf_counter()
-        U_new, ess, lam, vis_pos, vis_weights, mean_path = jax.block_until_ready(
-            self._run_update(subkey, obs)
-        )
+        out = jax.block_until_ready(self._run_update(subkey, obs))
+        U_new, ess, lam, vis_pos, vis_weights, mean_path = out[:6]
+        if self._multimodal:
+            U_modes, self._sigma_modes, best = out[6]
+            self._mode = int(best)
+            self._U_modes = self._shift_modes(U_modes, self._grid["dts"], self._dt)
         self._step_ms.append(1e3 * (time.perf_counter() - t_start))
         self._ess = float(ess)
         self._lam = float(lam)
@@ -1206,6 +1274,8 @@ class AttitudeMPPI(Controller):
         self._obstacle_now = None
         self._U_nom = jnp.tile(jnp.array([0.0, 0.0, 0.0, self._hover_thrust]), (self._horizon, 1))
         self._u_prev = self._U_nom[0]
+        self._U_modes = jnp.tile(self._U_nom, (self._opts.n_modes, 1, 1))
+        self._sigma_modes = jnp.tile(self._sigma, (self._opts.n_modes, 1))
         self._thrust = 0.0
         self._dist = np.zeros(3, dtype=np.float32)
         self._vel_pred = None
@@ -1215,3 +1285,113 @@ class AttitudeMPPI(Controller):
         # The gate normal is the gate's local x-axis in the world frame
         gates_normal = R.from_quat(obs["gates_quat"]).apply([1, 0, 0])
         return jnp.hstack([obs["gates_pos"], gates_normal])
+
+
+def mppi_update_multimodal(
+    key: Array,
+    x0: Array,
+    U_modes: Array,
+    sigma_modes: Array,
+    u_prev: Array,
+    ref: Array,
+    gates: Array,
+    obstacles_pos: Array,
+    params: dict,
+    grid: dict,
+    sigma0: Array,
+    target_ess: float,
+    cc: dict,
+    cw: dict,
+    opts: MPPIOptions,
+    dist_acc: Array | None = None,
+    path: dict | None = None,
+) -> tuple:
+    """One MPPI iteration with several modes (parallel means) and adaptive noise spread.
+
+    The samples are split evenly between the modes. Every mode is updated like a single MPPI with
+    its own temperature, and the mode whose updated mean sequence has the lowest cost is executed.
+    Modes that converge to the same local optimum would waste samples, so the most expensive mode
+    is reseeded every step from the best mean plus smooth noise. This keeps alternatives such as
+    the other side of an obstacle alive instead of averaging both sides into the obstacle.
+
+    With `opts.sigma_adapt > 0` the noise spread of every mode follows the weighted spread of its
+    own samples (low-pass filtered with gain `sigma_adapt` and clipped to `[0.3, 2] * sigma0`).
+
+    Args:
+        key: JAX PRNG key.
+        x0: Current state with shape (13,).
+        U_modes: Nominal sequences of the modes with shape (K, H, 4).
+        sigma_modes: Noise spread of the modes with shape (K, 4).
+        u_prev: Previously applied input with shape (4,).
+        ref: Reference at the knots with shape (H + 1, 6).
+        gates: Position and normal of every gate with shape (n_gates, 6).
+        obstacles_pos: Obstacle positions with shape (n_obstacles, 3).
+        params: Drone parameters.
+        grid: Time grid, see `mppi_update`.
+        sigma0: Base noise spread with shape (4,), for the smoothness cost and the reseeding.
+        target_ess: Desired effective sample size per mode as a fraction of its samples.
+        cc: Cost constants.
+        cw: Cost weights.
+        opts: Static options; `n_samples` is the total over all modes.
+        dist_acc: Estimated disturbance acceleration with shape (3,).
+        path: Path window for the contouring cost.
+
+    Returns:
+        U_new_modes (K, H, 4), sigma_modes (K, 4), the index of the executed mode, and the ESS,
+        temperature, visualized rollouts, their weights and the mean path of the executed mode.
+    """
+    n_modes = U_modes.shape[0]
+    keys = jax.random.split(key, n_modes + 1)
+    sub_opts = opts._replace(n_samples=opts.n_samples // n_modes)
+
+    def one_mode(k: Array, U: Array, sig: Array) -> dict:
+        return mppi_update(
+            k,
+            x0,
+            U,
+            u_prev,
+            ref,
+            gates,
+            obstacles_pos,
+            params,
+            grid,
+            sig,
+            target_ess,
+            cc,
+            cw,
+            opts=sub_opts,
+            dist_acc=dist_acc,
+            path=path,
+            sigma_cost=sigma0,
+            return_extra=True,
+        )
+
+    out = jax.vmap(one_mode)(keys[:n_modes], U_modes, sigma_modes)
+    cost = jnp.where(jnp.isfinite(out["mean_cost"]), out["mean_cost"], NAN_COST)
+    best = jnp.argmin(cost)
+    U_new = out["U_new"]
+    if opts.sigma_adapt > 0:
+        a = opts.sigma_adapt
+        sigma_modes = jnp.clip(
+            (1 - a) * sigma_modes + a * out["noise_std"], 0.3 * sigma0, 2 * sigma0
+        )
+    if n_modes > 1:
+        worst = jnp.argmax(cost)
+        lo = jnp.array([-1.0, -1.0, -1.0, 4 * params["thrust_min"]])
+        hi = jnp.array([1.0, 1.0, 1.0, 4 * params["thrust_max"]])
+        seed_opts = opts._replace(n_samples=1, noise_beta=0.9, truncated=False)
+        seed = sample_actions(keys[-1], U_new[best], sigma0, lo, hi, seed_opts)[0]
+        U_new = U_new.at[worst].set(jnp.where(worst == best, U_new[worst], seed))
+        sigma_modes = sigma_modes.at[worst].set(
+            jnp.where(worst == best, sigma_modes[worst], sigma0)
+        )
+    return (
+        U_new,
+        sigma_modes,
+        best,
+        out["ess"][best],
+        out["lam"][best],
+        out["vis_pos"][best],
+        out["vis_weights"][best],
+        out["mean_path"][best],
+    )
