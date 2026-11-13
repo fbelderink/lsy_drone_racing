@@ -269,6 +269,10 @@ DEFAULT_PARAMS = {
     "integrator": "euler",  # "euler", "exact" or "rk4", see `dynamics_step`
     "gate_mode": "slab",  # "slab", "crossing" or "both", see `trajectory_cost`
     "step_weighting": "dt",  # "dt": weight running costs by step length, "none": every knot alike
+    # Time constant in seconds of an exponential discount of the running costs, 0 for none. The
+    # spread of the rollouts grows with time, so undiscounted far-future costs dominate the cost
+    # differences between samples and drown the near-term terms that decide the next gate
+    "discount_tau": 0.0,
     # Disturbance estimate (roadmap item 3): low-pass filter of the gap between the observed and
     # the predicted velocity change, fed to the rollouts as a constant acceleration
     "dist_alpha": 0.0,  # filter gain per control step in (0, 1], 0 disables the estimate
@@ -858,12 +862,13 @@ class AttitudeMPPI(Controller):
         self._horizon = len(self._dts)  # number of planning steps
         # Index of every knot in the reference sampled at the control rate, shape (H + 1,)
         self._knot_idx = np.concatenate(([0], np.cumsum(factors)))
+        w = np.concatenate(([1], factors if p["step_weighting"] == "dt" else 1 + 0 * factors))
+        if p["discount_tau"] > 0:
+            t_knots = self._dt * self._knot_idx  # time of every state
+            w = w * np.exp(-t_knots / p["discount_tau"])
         self._grid = {
             "dts": jnp.asarray(self._dts),
-            "w": jnp.asarray(
-                np.concatenate(([1], factors if p["step_weighting"] == "dt" else 1 + 0 * factors)),
-                dtype=jnp.float32,
-            ),
+            "w": jnp.asarray(w, dtype=jnp.float32),
             "disc": None,  # set below, once the drone parameters are loaded
         }
         self._n_samples = int(p["n_samples"])  # sampled control sequences per step

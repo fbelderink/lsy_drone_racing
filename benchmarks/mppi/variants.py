@@ -14,6 +14,14 @@ LONG = {
     "gate_mode": "both",
 }
 
+# Discount (rollout variance) and z disturbance estimate (model bias), needed by long horizons
+DD = {"discount_tau": 0.3, "dist_alpha": 0.05, "dist_axes": [0.0, 0.0, 1.0]}
+U50_DD = {"horizon": 50, "integrator": "exact", **DD}
+LONG_DD = {**LONG, **DD}
+SHORT_BEST = {"integrator": "exact", "include_nominal": True, **DD}
+# Hybrid cost with only the gate bonus of the progress cost added to tracking
+BONUS_ONLY = {"contour_weight": 0.0, "progress_weight": 0.0, "speed_cap_weight": 0.0}
+
 VARIANTS: dict[str, dict] = {
     "baseline": {},
     "check": {},  # identical to baseline, used to verify that a refactor keeps the results
@@ -74,6 +82,49 @@ VARIANTS: dict[str, dict] = {
     },
     "uniform50": {"horizon": 50, "integrator": "exact"},
     "long_now": {**LONG, "step_weighting": "none"},
+    # Discounted running costs
+    "disc03": {"discount_tau": 0.3},
+    "disc05": {"discount_tau": 0.5},
+    "uniform50_disc03": {"horizon": 50, "integrator": "exact", "discount_tau": 0.3},
+    "uniform50_disc05": {"horizon": 50, "integrator": "exact", "discount_tau": 0.5},
+    "long_disc03": {**LONG, "discount_tau": 0.3},
+    "long_disc05": {**LONG, "discount_tau": 0.5},
+    "long_dist05_disc03": {**LONG, "dist_alpha": 0.05, "discount_tau": 0.3},
+    # The long horizon needs the discount (variance) and the disturbance estimate (bias) together
+    "u50_disc03_dist05": {
+        "horizon": 50,
+        "integrator": "exact",
+        "discount_tau": 0.3,
+        "dist_alpha": 0.05,
+    },
+    "u50_disc03_dist05z": {
+        "horizon": 50,
+        "integrator": "exact",
+        "discount_tau": 0.3,
+        "dist_alpha": 0.05,
+        "dist_axes": [0.0, 0.0, 1.0],
+    },
+    "long_dist05z_disc03": {
+        **LONG,
+        "dist_alpha": 0.05,
+        "dist_axes": [0.0, 0.0, 1.0],
+        "discount_tau": 0.3,
+    },
+    "disc03_dist05z": {"discount_tau": 0.3, "dist_alpha": 0.05, "dist_axes": [0.0, 0.0, 1.0]},
+    # Step 4b: long horizons skip the hairpin at gate 3 (the rollouts see the loop back over the
+    # frame and stay on the near side). The progress cost and its gate bonus reward passing.
+    "u50_dd_hybrid": {**U50_DD, "cost_mode": "hybrid"},
+    "u50_dd_bonus": {**U50_DD, "cost_mode": "hybrid", "cost_weights": BONUS_ONLY},
+    "long_dd_hybrid": {**LONG_DD, "cost_mode": "hybrid"},
+    "long_dd_bonus": {**LONG_DD, "cost_mode": "hybrid", "cost_weights": BONUS_ONLY},
+    "long_dd_contour": {**LONG_DD, "cost_mode": "contouring"},
+    # 0.8 s uniform horizon as a middle ground
+    "u40_dd": {**U50_DD, "horizon": 40},
+    "u40_dd_bonus": {**U50_DD, "horizon": 40, "cost_mode": "hybrid", "cost_weights": BONUS_ONLY},
+    # Best short-horizon combination of the individually neutral-to-positive features
+    "short_best": SHORT_BEST,
+    "short_best_bonus": {**SHORT_BEST, "cost_mode": "hybrid", "cost_weights": BONUS_ONLY},
+    "short_best_hybrid": {**SHORT_BEST, "cost_mode": "hybrid"},
     # Step 5: multi-modal MPPI and adaptive spread (same total of 1024 samples)
     "modes2": {"n_modes": 2},
     "modes4": {"n_modes": 4},
