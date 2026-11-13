@@ -19,7 +19,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import sys
+import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
@@ -72,7 +74,7 @@ def run_episode(config_name: str, controller: str, params: dict, seed: int) -> d
     config = load_config(ROOT / "config" / config_name)
     config.sim.render = False
     config.controller.mppi = params
-    controller_cls = load_controller(ROOT / "lsy_drone_racing/control" / controller)
+    controller_cls = load_controller(Path(controller))
 
     env = gymnasium.make(
         config.env.id,
@@ -239,6 +241,11 @@ def main(
 
     todo = [] if show else [n for n in names if rerun or load_results(config, n) is None]
     if todo:
+        # Snapshot the controller, so that editing it during a long run does not change the results
+        snap_dir = Path(tempfile.mkdtemp(prefix="bench_mppi_"))
+        snapshot = snap_dir / controller
+        shutil.copy(ROOT / "lsy_drone_racing/control" / controller, snapshot)
+        controller = str(snapshot)
         n_cpu = os.cpu_count() // 2
         ctx = get_context("spawn")
         queue = ctx.Queue()
