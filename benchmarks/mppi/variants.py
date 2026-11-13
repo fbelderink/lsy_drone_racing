@@ -22,6 +22,18 @@ SHORT_BEST = {"integrator": "exact", "include_nominal": True, **DD}
 # Hybrid cost with only the gate bonus of the progress cost added to tracking
 BONUS_ONLY = {"contour_weight": 0.0, "progress_weight": 0.0, "speed_cap_weight": 0.0}
 
+# Faster reference speed profiles (mid-level controller limits); default: a_lat 5, a_long 8,
+# a_brake 7, v_gate_max 2
+FAST = {
+    1: {"a_lat_max": 8.0, "v_gate_max": 3.0},
+    2: {"a_lat_max": 10.0, "a_long_max": 10.0, "a_brake_max": 10.0, "v_gate_max": 3.0},
+    3: {"a_lat_max": 10.0, "a_long_max": 10.0, "a_brake_max": 10.0, "v_gate_max": 4.0},
+    4: {"a_lat_max": 12.0, "a_long_max": 12.0, "a_brake_max": 12.0, "v_gate_max": 4.0},
+}
+
+LAT8 = {"a_lat_max": 8.0, "a_long_max": 10.0, "a_brake_max": 10.0, "v_gate_max": 2.0}
+LAT10 = {**LAT8, "a_lat_max": 10.0}
+
 VARIANTS: dict[str, dict] = {
     "baseline": {},
     "check": {},  # identical to baseline, used to verify that a refactor keeps the results
@@ -125,9 +137,45 @@ VARIANTS: dict[str, dict] = {
     "short_best": SHORT_BEST,
     "short_best_bonus": {**SHORT_BEST, "cost_mode": "hybrid", "cost_weights": BONUS_ONLY},
     "short_best_hybrid": {**SHORT_BEST, "cost_mode": "hybrid"},
+    # Speed: the lap time is set by the reference speed profile, not by the input limits (see
+    # `speed_limits.py`). Profile lap times on seed 1: 6.28 s now, 4.74 / 4.39 / 4.08 / 3.77 s.
+    "sb_fast1": {**SHORT_BEST, "mlc": FAST[1]},
+    "sb_fast2": {**SHORT_BEST, "mlc": FAST[2]},
+    "sb_fast3": {**SHORT_BEST, "mlc": FAST[3]},
+    "sb_fast4": {**SHORT_BEST, "mlc": FAST[4]},
+    "u50b_fast2": {**U50_DD, "cost_mode": "hybrid", "cost_weights": BONUS_ONLY, "mlc": FAST[2]},
+    "u50b_fast3": {**U50_DD, "cost_mode": "hybrid", "cost_weights": BONUS_ONLY, "mlc": FAST[3]},
+    "u50b_fast4": {**U50_DD, "cost_mode": "hybrid", "cost_weights": BONUS_ONLY, "mlc": FAST[4]},
+    # Speed grid: lateral acceleration x gate cap, with a_long = a_brake = 10
+    **{
+        f"sb_lat{a}_vg{str(vg).replace('.', '')}": {
+            **SHORT_BEST,
+            "mlc": {
+                "a_lat_max": float(a),
+                "a_long_max": 10.0,
+                "a_brake_max": 10.0,
+                "v_gate_max": vg,
+            },
+        }
+        for a in (7, 8, 9, 10, 12)
+        for vg in (2.0, 2.5, 3.0)
+    },
     # Step 5: multi-modal MPPI and adaptive spread (same total of 1024 samples)
     "modes2": {"n_modes": 2},
     "modes4": {"n_modes": 4},
     "sadapt": {"sigma_adapt": 0.1},
     "modes4_sadapt": {"n_modes": 4, "sigma_adapt": 0.1},
+    # Step 6: GPU closed loop (run with the gpu environment and JAX_PLATFORMS=cuda; the results
+    # differ numerically from the CPU ones, so they are only compared with each other)
+    "gpu_sb": SHORT_BEST,
+    "gpu_sb_4k": {**SHORT_BEST, "n_samples": 4096},
+    "gpu_sb_16k": {**SHORT_BEST, "n_samples": 16384},
+    "gpu_sb_16k_modes4": {**SHORT_BEST, "n_samples": 16384, "n_modes": 4},
+    "gpu_sb_16k_sadapt": {**SHORT_BEST, "n_samples": 16384, "sigma_adapt": 0.1},
+    # GPU: does a larger sample budget allow the faster profiles?
+    "gpu_sb_lat8": {**SHORT_BEST, "mlc": LAT8},
+    "gpu_sb_16k_lat8": {**SHORT_BEST, "n_samples": 16384, "mlc": LAT8},
+    "gpu_sb_lat10": {**SHORT_BEST, "mlc": LAT10},
+    "gpu_sb_16k_lat10": {**SHORT_BEST, "n_samples": 16384, "mlc": LAT10},
+    "gpu_sb_16k_lat8_vg25": {**SHORT_BEST, "n_samples": 16384, "mlc": {**LAT8, "v_gate_max": 2.5}},
 }
