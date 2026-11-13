@@ -325,6 +325,70 @@ Reading:
   loop comes into view. This is the dependency on the progress cost: the gate bonus of
   `contouring_cost` rewards crossing the next gate (benchmarked next).
 
+### The long horizon needs the progress cost (300 episodes)
+
+| variant | success | t mean | Δt paired | ms/step | failures (gate/miss/obst/other) |
+|---|---|---|---|---|---|
+| baseline | 281 (93.7 %) | 6.164 | — | 13.9 | 13/3/3/0 |
+| `short_best` (exact, nominal, τ = 0.3, z disturbance) | **287 (95.7 %)** | **6.170** | **+0.001** | 13.7 | 5/4/4/0 |
+| `short_best_bonus` (+ gate bonus) | 282 (94.0 %) | 6.130 | −0.041 | 21.2 | 7/4/7/0 |
+| `short_best_hybrid` (+ full progress cost) | 286 (95.3 %) | 6.146 | −0.024 | 21.2 | 4/3/7/0 |
+| `u50_disc03_dist05z` (1.0 s, tracking only) | 245 (81.7 %) | 6.235 | +0.078 | 22.4 | 9/40/6/0 |
+| `u50_dd_bonus` (1.0 s + gate bonus) | 287 (95.7 %) | 6.346 | +0.180 | 34.2 | 3/6/4/0 |
+| `u50_dd_hybrid` (1.0 s + full progress cost) | **290 (96.7 %)** | 6.467 | +0.297 | 34.2 | 4/3/3/0 |
+| `u40_dd` (0.8 s, tracking only) | 276 (92.0 %) | 6.188 | +0.020 | 17.9 | 7/13/4/0 |
+| `u40_dd_bonus` (0.8 s + gate bonus) | 286 (95.3 %) | 6.245 | +0.076 | 27.6 | 4/7/3/0 |
+| `long_dist05z_disc03` (roadmap grid 1.1 s, tracking only) | 227 (75.7 %) | 6.584 | +0.422 | 14.4 | 7/62/4/0 |
+| `long_dd_bonus` (roadmap grid + gate bonus) | 272 (90.7 %) | 6.969 | +0.811 | 20.8 | 5/17/6/0 |
+| `long_dd_hybrid` | 278 (92.7 %) | 7.212 | +1.056 | 20.8 | 3/15/4/0 |
+| `long_dd_contour` (roadmap grid + pure contouring) | **291 (97.0 %)** | 9.116 | +2.946 | 20.3 | 1/5/2/1 |
+
+`BONUS_ONLY` sets the contour, progress and speed-cap weights to 0, so only the gate bonus is
+added to the tracking cost.
+
+Reading:
+
+- **Dependency confirmed: the gate bonus fixes the long horizon** (1.0 s: 245 → 287, 0.8 s: 276 →
+  286), while on the 0.6 s horizon it brings nothing (287 → 282). The full progress cost on top of
+  the 1.0 s horizon gives the highest success rate at a usable speed (290), at +0.3 s and 2.5× the
+  compute per step.
+- **The coarse roadmap grid is slower** than a uniform 1.0 s grid (+0.8 s with the bonus): the
+  0.06 s steps hold a command three times as long, so the rollouts cannot represent the quick
+  attitude changes and the optimum becomes conservative. With pure contouring it is the most robust
+  configuration overall (291), but 3 s slower; it is a safe mode, not a racing mode.
+- **`short_best` is the best trade-off**: +6 successes against the baseline at the same lap time and
+  compute. The gains come from the light-drone z offset (seeds 79, 95, 98) and seed 7.
+
+## Speed analysis — what limits the lap time (`benchmarks/mppi/speed_limits.py`)
+
+Other teams reach laps below 4 s; we fly 6.2 s. Measured with `short_best` on seeds 1–6:
+
+- **The inputs are not saturated.** Commanded |roll| and |pitch| reach at most 0.93 rad (limit
+  1.0), the combined tilt 1.0 rad at the 99th percentile, the thrust at most 94 % of its maximum.
+  The thrust-to-weight ratio is 1.80, so the drone holds altitude only up to a tilt of 56°, where it
+  reaches its maximum level acceleration of 14.7 m/s². **Raising the roll/pitch limit above 1 rad
+  (57°) cannot add horizontal acceleration**; it would only trade altitude for it.
+- **The reference speed profile sets the lap time.** The drone follows it within a few cm (flown
+  time ≈ profile time ≈ 6.2 s). Over the 12.2 m path, 52 % is capped by the 2 m/s limit around not
+  yet revealed gates (`v_gate_max`) and 42 % by the lateral acceleration limit of 5 m/s², a third of
+  what the drone can do.
+
+Profile lap time on seed 1 for other mid-level limits (offline, nominal gates):
+
+| a_lat | a_long / a_brake | v_gate_max | profile time |
+|---|---|---|---|
+| 5 | 8 / 7 | 2 | 6.28 s (current) |
+| 8 | 8 / 7 | 2 | 5.68 s |
+| 5 | 8 / 7 | 3 | 5.54 s |
+| 8 | 8 / 7 | 3 | 4.74 s |
+| 10 | 10 / 10 | 3 | 4.39 s |
+| 10 | 10 / 10 | 4 | 4.08 s |
+| 12 | 12 / 12 | 4 | 3.77 s |
+
+Spot check on seed 1: with `v_gate_max` 4 the drone reaches gate 3 too fast for its late reveal and
+overshoots it by 0.5 m, also with the 1.0 s horizon; with 3 m/s all gates are passed in ~5.5 s. The
+grid below screens the lateral limit against the gate cap in closed loop.
+
 ### Note on the benchmark machine
 
 Stopping a benchmark with `pkill` on the parent left its 8 workers running; together with a new
