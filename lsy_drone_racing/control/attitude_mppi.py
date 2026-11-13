@@ -13,6 +13,7 @@ State and input conventions follow `attitude_mpc.py`, with the thrust state appe
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any
 
 import jax
@@ -118,6 +119,14 @@ COST_WEIGHTS = {
     "obstacle_weight": 50.0,  # Weight for coming close to an obstacle
 }
 
+DEFAULT_PARAMS = {
+    "horizon": 30,  # planning steps, 0.6 s at 50 Hz
+    "n_samples": 1024,  # sampled control sequences per step
+    "sigma": [0.9, 0.9, 0.0, 0.3],  # noise std: roll, pitch, yaw (rad), thrust (N)
+    "target_ess": 0.05,  # fraction of samples that should effectively contribute to the update
+    "rng_seed": 0,  # seed of the sampling noise
+}
+
 MLC_CONSTANTS = {
     "v_max": 6.0,
     "a_long_max": 8.0,  # most important in the current setup for speed
@@ -130,7 +139,15 @@ MLC_CONSTANTS = {
 
 
 def trajectory_cost(
-    X: Array, U: Array, u_prev: Array, ref: Array, gates: Array, obstacles_pos: Array, sigma: Array
+    X: Array,
+    U: Array,
+    u_prev: Array,
+    ref: Array,
+    gates: Array,
+    obstacles_pos: Array,
+    sigma: Array,
+    cc: dict,
+    cw: dict,
 ) -> Array:
     """Compute the cost of a single rollout.
 
@@ -145,6 +162,8 @@ def trajectory_cost(
         obstacles_pos: Obstacle positions with shape (n_obstacles, 3). Obstacles are vertical
             poles, so only the x and y coordinates are used.
         sigma: Standard deviation of the control input with shape (4,).
+        cc: Cost constants, see `COST_CONSTANTS`.
+        cw: Cost weights, see `COST_WEIGHTS`.
 
     Returns:
         The scalar cost.
@@ -152,12 +171,12 @@ def trajectory_cost(
     # Deviation from reference trajectory
     pos = X[:, :3]  # Extract positions from the state trajectory
     ref_pos = ref[:, :3]  # Extract reference positions
-    tol = jnp.maximum(1e-6, COST_CONSTANTS["deviation_tolerance"])
+    tol = jnp.maximum(1e-6, cc["deviation_tolerance"])
     pos_error_per_step = jnp.square((pos - ref_pos) / tol)  # Compute per-step position error
     deviation_cost = jnp.sum(pos_error_per_step)
 
     # Deviation from the reference velocity, so the speed profile (e.g. slowing before gates) is followed
-    vel_tol = jnp.maximum(1e-6, COST_CONSTANTS["velocity_tolerance"])
+    vel_tol = jnp.maximum(1e-6, cc["velocity_tolerance"])
     vel_error_per_step = jnp.square((X[:, 6:9] - ref[:, 3:6]) / vel_tol)
     velocity_cost = jnp.sum(vel_error_per_step)
 
@@ -168,7 +187,7 @@ def trajectory_cost(
     control_diff = jnp.diff(
         U_including_prev, axis=0
     )  # Compute differences between consecutive control inputs
-    control_diff /= COST_CONSTANTS["smoothness_tolerance"] * jnp.maximum(1e-6, sigma)
+    control_diff /= cc["smoothness_tolerance"] * jnp.maximum(1e-6, sigma)
     smoothness_cost = jnp.sum(jnp.linalg.norm(control_diff, axis=1))
 
     # Cost for gate collisi0 on: states near a gate's plane must be close to its center, for every gate
@@ -178,7 +197,7 @@ def trajectory_cost(
     gate_offset = pos[:, None, :] - gate_pos[None, :, :]  # Offset of each state to each gate center
     # a state is near a gate if it is within a thin slab around the gate's plane
     distance = jnp.sum(gate_offset * gate_normal[None, :, :], axis=-1)
-    near_gate_mask = jnp.abs(distance) < COST_CONSTANTS["gate_slab"]
+    near_gate_mask = jnp.abs(distance) < cc["gate_slab"]
     # use maxnorm(to not punish corners) of distance to gate center along gate plane primary axes
     # primary axes are always vertical axis and the cross between normal and vertical axis
     vertical_distance = gate_offset[..., 2]
@@ -187,26 +206,26 @@ def trajectory_cost(
     )
     gate_plane_max_distance = jnp.maximum(jnp.abs(vertical_distance), jnp.abs(horizontal_distance))
     # states beside the frame, outside of its outer edge, are free
-    frame_mask = near_gate_mask & (gate_plane_max_distance < COST_CONSTANTS["gate_frame_limit"])
+    frame_mask = near_gate_mask & (gate_plane_max_distance < cc["gate_frame_limit"])
 
     # cost function based on distance to gate center
     distance_further_than_tolerance = jnp.maximum(
-        gate_plane_max_distance / COST_CONSTANTS["gate_tolerance"] - 1, 0
+        gate_plane_max_distance / cc["gate_tolerance"] - 1, 0
     )
     gate_cost = jnp.sum(jnp.where(frame_mask, distance_further_than_tolerance**2, 0))
 
     # Cost for coming close to an obstacle: tube around each pole, checked in the x-y plane
     obstacle_xy_distance = jnp.linalg.norm(pos[:, None, :2] - obstacles_pos[None, :, :2], axis=-1)
     # 0 outside the tube radius, rising to 1 at the pole's axis
-    tube_penetration = jnp.maximum(1 - obstacle_xy_distance / COST_CONSTANTS["obstacle_radius"], 0)
+    tube_penetration = jnp.maximum(1 - obstacle_xy_distance / cc["obstacle_radius"], 0)
     obstacle_cost = jnp.sum(tube_penetration**2)
 
     total_cost = (
-        COST_WEIGHTS["deviation_weight"] * deviation_cost
-        + COST_WEIGHTS["velocity_weight"] * velocity_cost
-        + COST_WEIGHTS["smoothness_weight"] * smoothness_cost
-        + COST_WEIGHTS["gate_weight"] * gate_cost
-        + COST_WEIGHTS["obstacle_weight"] * obstacle_cost
+        cw["deviation_weight"] * deviation_cost
+        + cw["velocity_weight"] * velocity_cost
+        + cw["smoothness_weight"] * smoothness_cost
+        + cw["gate_weight"] * gate_cost
+        + cw["obstacle_weight"] * obstacle_cost
     )  # Add other cost components if needed
 
     return total_cost
@@ -322,6 +341,8 @@ def mppi_update(
     n_samples: int,
     sigma: Array,
     target_ess: float,
+    cc: dict,
+    cw: dict,
 ) -> tuple[Array, Array, Array, Array, Array, Array]:
     """Perform one MPPI iteration.
 
@@ -342,6 +363,8 @@ def mppi_update(
         n_samples: Number of sampled control sequences.
         sigma: Per-channel standard deviation of the sampling noise with shape (4,).
         target_ess: Desired effective sample size as a fraction of n_samples.
+        cc: Cost constants, see `COST_CONSTANTS`.
+        cw: Cost weights, see `COST_WEIGHTS`.
 
     Returns:
         - U_new: The updated nominal control sequence with shape (H, 4).
@@ -370,12 +393,14 @@ def mppi_update(
     rollout_batch_of_trajectories = jax.vmap(rollout_jit, in_axes=(None, 0, None, None))
 
     cost_jit = jax.jit(trajectory_cost)
-    trajectory_cost_for_batch = jax.vmap(cost_jit, in_axes=(0, 0, None, None, None, None, None))
+    trajectory_cost_for_batch = jax.vmap(
+        cost_jit, in_axes=(0, 0, None, None, None, None, None, None, None)
+    )
 
     rollouts = rollout_batch_of_trajectories(x0, sampled_actions, params, dt)
 
     costs = trajectory_cost_for_batch(
-        rollouts, sampled_actions, u_prev, ref, gates, obstacles_pos, sigma
+        rollouts, sampled_actions, u_prev, ref, gates, obstacles_pos, sigma, cc, cw
     )
 
     # weighting the runs by costs
@@ -440,16 +465,25 @@ class AttitudeMPPI(Controller):
             config: The race configuration.
         """
         super().__init__(obs, info, config)
+        # Tunables, overridable through `config.controller.mppi` (used by the benchmark harness)
+        overrides = dict(config.controller.get("mppi", {}))
+        p = {**DEFAULT_PARAMS, **{k: v for k, v in overrides.items() if k in DEFAULT_PARAMS}}
+        unknown = set(overrides) - set(DEFAULT_PARAMS) - {"cost_constants", "cost_weights", "mlc"}
+        if unknown:
+            raise ValueError(f"Unknown MPPI parameters: {sorted(unknown)}")
+        self._p = p
+        self._cc = {**COST_CONSTANTS, **dict(overrides.get("cost_constants", {}))}
+        self._cw = {**COST_WEIGHTS, **dict(overrides.get("cost_weights", {}))}
+        mlc = {**MLC_CONSTANTS, **dict(overrides.get("mlc", {}))}
+
         self._freq = config.env.freq
         self._dt = 1 / self._freq
-        self._horizon = 30  # planning steps, 0.5 s at 50 Hz
-        self._n_samples = 1024  # sampled control sequences per step
-        self._sigma = (
-            jnp.array([0.15, 0.15, 0.0, 0.05]) * 6.0
-        )  # noise std: roll, pitch, yaw, thrust
-        self._target_ess = (
-            0.05  # fraction of samples that should effectively contribute to the update
-        )
+        self._horizon = int(p["horizon"])  # planning steps, 0.5 s at 50 Hz
+        self._n_samples = int(p["n_samples"])  # sampled control sequences per step
+        self._sigma = jnp.asarray(p["sigma"], dtype=jnp.float32)  # noise std: r, p, y, thrust
+        # fraction of samples that should effectively contribute to the update
+        self._target_ess = float(p["target_ess"])
+        self._step_ms = []  # wall time of every MPPI update, for benchmarking
         self._lam = float("nan")  # softmin temperature, adapted every step to reach the target ESS
         self._params = load_params(Dynamics.so_rpy_rotor_drag, config.sim.drone)
         # Hover command, inverted from force = acc_coef + cmd_f_coef * cmd
@@ -460,18 +494,18 @@ class AttitudeMPPI(Controller):
 
         self._mlc = MidLevelController(
             SplinePlanner(obs, config),
-            v_max=MLC_CONSTANTS["v_max"],
-            a_long_max=MLC_CONSTANTS["a_long_max"],
-            a_lat_max=MLC_CONSTANTS["a_lat_max"],
-            a_brake_max=MLC_CONSTANTS["a_brake_max"],
-            v_gate_max=MLC_CONSTANTS["v_gate_max"],
-            gate_window=MLC_CONSTANTS["gate_window"],
-            gate_plateau=MLC_CONSTANTS["gate_plateau"],
+            v_max=mlc["v_max"],
+            a_long_max=mlc["a_long_max"],
+            a_lat_max=mlc["a_lat_max"],
+            a_brake_max=mlc["a_brake_max"],
+            v_gate_max=mlc["v_gate_max"],
+            gate_window=mlc["gate_window"],
+            gate_plateau=mlc["gate_plateau"],
         )
 
         # n_samples fixes an array shape, so it must be static for jit
         self._update = jax.jit(mppi_update, static_argnames=("n_samples",))
-        self._key = jax.random.key(0)
+        self._key = jax.random.key(int(p["rng_seed"]))
         # Warm start: hold hover thrust with level attitude
         self._U_nom = jnp.tile(jnp.array([0.0, 0.0, 0.0, self._hover_thrust]), (self._horizon, 1))
         self._u_prev = self._U_nom[0]
@@ -488,8 +522,12 @@ class AttitudeMPPI(Controller):
         self._ref = self._mlc.get_trajectory(obs, self._horizon, self._dt)
 
         # Warm-up call so the jit compilation happens here and not in the first control step
-        self._update(
-            self._key,
+        jax.block_until_ready(self._run_update(self._key, obs))
+
+    def _run_update(self, key: Array, obs: dict[str, NDArray[np.floating]]) -> tuple:
+        """Run one jitted MPPI update for the current observation and nominal sequence."""
+        return self._update(
+            key,
             self._state(obs),
             self._U_nom,
             self._u_prev,
@@ -501,6 +539,8 @@ class AttitudeMPPI(Controller):
             self._n_samples,
             self._sigma,
             self._target_ess,
+            self._cc,
+            self._cw,
         )
 
     def _state(self, obs: dict[str, NDArray[np.floating]]) -> Array:
@@ -533,20 +573,11 @@ class AttitudeMPPI(Controller):
 
         # Fresh noise every step: split the key, keep one half and use the other
         self._key, subkey = jax.random.split(self._key)
-        U_new, ess, lam, vis_pos, vis_weights, mean_path = self._update(
-            subkey,
-            self._state(obs),
-            self._U_nom,
-            self._u_prev,
-            self._ref,
-            self._get_gates_pos_and_normal(obs),
-            jnp.asarray(obs["obstacles_pos"]),
-            self._params,
-            self._dt,
-            self._n_samples,
-            self._sigma,
-            self._target_ess,
+        t_start = time.perf_counter()
+        U_new, ess, lam, vis_pos, vis_weights, mean_path = jax.block_until_ready(
+            self._run_update(subkey, obs)
         )
+        self._step_ms.append(1e3 * (time.perf_counter() - t_start))
         self._ess = float(ess)
         self._lam = float(lam)
         self._vis = (np.asarray(vis_pos), np.asarray(vis_weights), np.asarray(mean_path))
@@ -575,7 +606,8 @@ class AttitudeMPPI(Controller):
         Returns:
             True if the controller is finished, False otherwise.
         """
-        return self._finished | int(obs["n_gates_passed"]) == len(obs["gate_sequence"])
+        # `or`, not `|`: `|` binds tighter than `==` and compared `finished | n_passed` to the count
+        return self._finished or int(obs["n_gates_passed"]) == len(obs["gate_sequence"])
 
     def render_callback(self, sim: Sim):
         """Draw the reference by speed, the sampled rollouts by weight and the mean action path.
@@ -643,7 +675,7 @@ class AttitudeMPPI(Controller):
         if self._gate_now is None:
             return
         cyan, orange = (0.0, 0.9, 1.0, 1.0), (1.0, 0.5, 0.0, 0.4)
-        tolerance = COST_CONSTANTS["gate_tolerance"]
+        tolerance = self._cc["gate_tolerance"]
         for i, (pos, quat) in enumerate(zip(*self._gate_now)):
             # Earlier perceptions, linked to where the gate is perceived now
             for old_pos, old_quat in self._gate_old[i]:
@@ -683,7 +715,7 @@ class AttitudeMPPI(Controller):
         if self._obstacle_now is None:
             return
         cyan, orange = (0.0, 0.9, 1.0, 1.0), (1.0, 0.5, 0.0, 0.4)
-        radius = COST_CONSTANTS["obstacle_radius"]
+        radius = self._cc["obstacle_radius"]
         z_tube = float(self._ref[0, 2])  # tube is drawn at the height the drone is flying at
         for i, pos in enumerate(self._obstacle_now):
             # Earlier perceptions, linked to where the obstacle is perceived now
