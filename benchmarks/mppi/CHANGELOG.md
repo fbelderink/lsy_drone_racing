@@ -69,3 +69,52 @@ Seeds that fail for all three noise seeds: 7, 37, 85, 95, 98.
 Implications for the roadmap: the disturbance estimate (item 3) targets the z offset directly. A
 longer horizon (item 2) should help react to the late gate reveal and see the obstacle behind gate 0
 earlier.
+
+---
+
+## Step 1 — cheap features from the reference (smoothed noise, truncated sampling, nominal samples, NaN guard)
+
+### Changes (`attitude_mppi.py`, all off by default)
+
+- `MPPIOptions`: one hashable tuple of static options (sample count and feature switches) passed
+  to the jitted update, instead of `n_samples` alone.
+- `sample_actions`:
+  - `noise_beta`: temporally smoothed noise, an AR(1) process per sample and channel,
+    `e_t = beta e_(t-1) + sqrt(1 - beta^2) w_t`. The `sqrt(1 - beta^2)` keeps the marginal standard
+    deviation at `sigma`.
+  - `truncated`: white noise drawn from a normal truncated to the action limits instead of clipped.
+- `include_nominal`: sample 0 is the unperturbed nominal sequence, sample 1 is hovering.
+- `nan_guard`: NaN or inf rollout costs are replaced with 1e9.
+
+### Results (300 episodes each)
+
+| variant | success | t mean | Δt paired | gained / lost | failures |
+|---|---|---|---|---|---|
+| baseline | 281 (93.7 %) | 6.165 | | | gate 12, obstacle 4, missed 3 |
+| `nan_guard` | 281 | 6.165 | 0.000 | 0 / 0 | bit-identical: no NaN or inf cost occurs |
+| `include_nominal` | **283** | 6.162 | −0.004 ± 0.003 | 7 / 5 | gate 11, obstacle 2, missed 4 |
+| β = 0.3 | 278 | 6.165 | +0.001 ± 0.003 | 5 / 8 | missed 6 |
+| β = 0.6 | 261 | 6.144 | −0.017 ± 0.004 | 6 / 26 | **missed 23** |
+| β = 0.8 | 220 | 6.102 | −0.071 ± 0.006 | 6 / 67 | **missed 68** |
+| `truncated` | 271 | **7.200** | **+1.019 ± 0.033** | 7 / 17 | missed 14, gate 13 |
+
+### Interpretation
+
+- **NaN guard**: no effect, because no rollout ever diverges with the current model and step length.
+  Kept as insurance for coarse steps and new cost terms (zero cost).
+- **Nominal and hover samples**: within the noise floor, slightly positive. Kept: cheap and it
+  guarantees that the update can always keep the current plan.
+- **Smoothed noise** makes the drone faster on the seeds it finishes (−0.07 s at β = 0.8) but fails
+  more and more by flying past gates (missed gate, no contact). With the marginal `sigma` kept, the
+  variance of the noise summed over the horizon grows by (1 + β) / (1 − β), i.e. 4× at β = 0.6 and
+  9× at β = 0.8. The rollouts fan out much further, fewer samples stay near the gate, and the mean
+  is a mix of far-apart paths. **Dependency**: β and `sigma` have to be tuned together. Step 1b
+  tests β with `sigma` scaled by sqrt((1 − β) / (1 + β)). Smoothed noise may also pay off only with
+  a longer horizon (where a few coarse, smooth inputs have to cover 1 s) or with more samples.
+- **Truncated sampling** is 1 s slower (max. speed 2.92 → 2.57 m/s). A normal truncated near a limit
+  has its mean pulled toward the interior. MPPI averages the samples, so this biases every update
+  toward level attitude and away from the limits, which the fast maneuvers use (roll and pitch are
+  at ±1 rad often with `sigma` = 0.9). Clipping keeps the mean at the limit. Not adopted. It would
+  need the update to use the noise relative to the truncated mean, or a smaller `sigma`.
+
+Adopted for later steps: `include_nominal` and `nan_guard`.

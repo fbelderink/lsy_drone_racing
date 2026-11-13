@@ -14,7 +14,7 @@ State and input conventions follow `attitude_mpc.py`, with the thrust state appe
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -36,21 +36,19 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 
-def dynamics_step(x: Array, u: Array, params: dict, dt: float) -> Array:
-    """Advance the so_rpy_rotor_drag model by one time step.
+def state_derivative(x: Array, u: Array, params: dict) -> Array:
+    """Continuous-time derivative of the so_rpy_rotor_drag model.
 
     Args:
         x: State [pos, rpy, vel, drpy, thrust] with shape (13,).
         u: Input [roll, pitch, yaw, thrust] with shape (4,).
         params: Drone parameters as returned by `crazyflow.dynamics.load_params`.
-        dt: Integration step in seconds.
 
     Returns:
-        The next state with shape (13,).
+        The state derivative with shape (13,).
     """
-    # TODO Check if RK4 integration is necessary, or if Euler is sufficient for the small dt.
     pos, rpy, vel, drpy, thrust = jnp.split(x, [3, 6, 9, 12])
-    x_dot = jnp.concatenate(
+    return jnp.concatenate(
         dynamics_euler(
             pos=pos,
             rpy=rpy,
@@ -70,35 +68,161 @@ def dynamics_step(x: Array, u: Array, params: dict, dt: float) -> Array:
         )
     )
 
-    # Euler integration step
-    x_next = x + dt * x_dot
 
-    return x_next
+def discretize(params: dict, dts: NDArray) -> dict:
+    """Exact zero-order-hold discretization of the linear attitude and thrust dynamics.
+
+    Every attitude axis is the linear system `[a, a_dot]' = [[0, 1], [k_a, k_r]] [a, a_dot] + [0, k_c] u`
+    and the thrust a first-order lag with rate `k_t`. Both are discretized exactly for each step
+    length with a matrix exponential, which is stable and exact for any step length (Euler diverges
+    for the roll/pitch dynamics near 0.12 s and is poor already at 0.06 s).
+
+    Args:
+        params: Drone parameters.
+        dts: Step lengths with shape (H,).
+
+    Returns:
+        Dict with `Ad` (H, 3, 2, 2), `Bd` (H, 3, 2) and `thrust_gain` (H,), the fraction of the gap
+        between command and thrust that is closed within a step.
+    """
+    from scipy.linalg import expm
+
+    k_a, k_r, k_c = (np.asarray(params[k]) for k in ("rpy_coef", "rpy_rates_coef", "cmd_rpy_coef"))
+    Ad = np.zeros((len(dts), 3, 2, 2))
+    Bd = np.zeros((len(dts), 3, 2))
+    for i, dt in enumerate(dts):
+        for axis in range(3):
+            M = np.zeros((3, 3))
+            M[0, 1] = 1.0
+            M[1] = [k_a[axis], k_r[axis], k_c[axis]]
+            E = expm(M * dt)
+            Ad[i, axis], Bd[i, axis] = E[:2, :2], E[:2, 2]
+    thrust_gain = 1 - np.exp(-float(params["thrust_dyn_coef"]) * np.asarray(dts))
+    return {
+        "Ad": jnp.asarray(Ad, dtype=jnp.float32),
+        "Bd": jnp.asarray(Bd, dtype=jnp.float32),
+        "thrust_gain": jnp.asarray(thrust_gain, dtype=jnp.float32),
+    }
 
 
-def rollout(x0: Array, U: Array, params: dict, dt: float) -> Array:
+def dynamics_step(
+    x: Array,
+    u: Array,
+    params: dict,
+    dt: Array,
+    disc: dict,
+    integrator: str = "euler",
+    dist_acc: Array | None = None,
+) -> Array:
+    """Advance the so_rpy_rotor_drag model by one time step.
+
+    Integrators:
+        euler: forward Euler on the full state (the original scheme).
+        exact: exact discretization of attitude and thrust (`disc`), translation with the
+            trapezoidal rule on the accelerations at the start and the end of the step. The
+            acceleration varies with attitude and thrust within the step, so this is second order.
+        rk4: classic Runge-Kutta on the full state, as an accuracy reference.
+
+    Args:
+        x: State [pos, rpy, vel, drpy, thrust] with shape (13,).
+        u: Input [roll, pitch, yaw, thrust] with shape (4,).
+        params: Drone parameters as returned by `crazyflow.dynamics.load_params`.
+        dt: Step length in seconds.
+        disc: This step's slice of `discretize` (`Ad` (3, 2, 2), `Bd` (3, 2), `thrust_gain`).
+        integrator: One of "euler", "exact", "rk4".
+        dist_acc: Constant disturbance acceleration in the world frame with shape (3,), or None.
+
+    Returns:
+        The next state with shape (13,).
+    """
+
+    def f(x: Array) -> Array:
+        x_dot = state_derivative(x, u, params)
+        if dist_acc is not None:
+            x_dot = x_dot.at[6:9].add(dist_acc)
+        return x_dot
+
+    if integrator == "euler":
+        return x + dt * f(x)
+    if integrator == "rk4":
+        k1 = f(x)
+        k2 = f(x + 0.5 * dt * k1)
+        k3 = f(x + 0.5 * dt * k2)
+        k4 = f(x + dt * k3)
+        return x + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+    if integrator != "exact":
+        raise ValueError(f"Unknown integrator {integrator}")
+    pos, rpy, vel, drpy, thrust = jnp.split(x, [3, 6, 9, 12])
+    att = jnp.stack((rpy, drpy), axis=-1)  # (3, 2): angle and rate per axis
+    att_next = jnp.einsum("aij,aj->ai", disc["Ad"], att) + disc["Bd"] * u[:3, None]
+    thrust_next = thrust + disc["thrust_gain"] * (u[3] - thrust)
+    acc0 = f(x)[6:9]
+    # acceleration at the end of the step, with the velocity predicted by Euler
+    x_end = jnp.concatenate((pos, att_next[:, 0], vel + dt * acc0, att_next[:, 1], thrust_next))
+    acc1 = f(x_end)[6:9]
+    vel_next = vel + 0.5 * dt * (acc0 + acc1)
+    # exact for an acceleration that changes linearly over the step
+    pos_next = pos + dt * vel + dt**2 / 6 * (2 * acc0 + acc1)
+    return jnp.concatenate((pos_next, att_next[:, 0], vel_next, att_next[:, 1], thrust_next))
+
+
+def rollout(
+    x0: Array,
+    U: Array,
+    params: dict,
+    dts: Array,
+    disc: dict,
+    integrator: str = "euler",
+    dist_acc: Array | None = None,
+) -> Array:
     """Simulate a control sequence starting from x0.
 
     Args:
         x0: Initial state with shape (13,).
-        U: Control sequence with shape (H, 4).
+        U: Control sequence with shape (H, 4). Input `k` is held for `dts[k]` seconds.
         params: Drone parameters.
-        dt: Integration step in seconds.
+        dts: Step lengths with shape (H,).
+        disc: Discretization of every step, see `discretize`.
+        integrator: One of "euler", "exact", "rk4", see `dynamics_step`.
+        dist_acc: Constant disturbance acceleration with shape (3,), or None.
 
     Returns:
         The state trajectory with shape (H + 1, 13), including x0.
     """
 
-    # Define a step function for the scan operation
-    def step_fn(x, u):
-        x_next = dynamics_step(x, u, params, dt)
+    def step_fn(x: Array, inputs: tuple) -> tuple[Array, Array]:
+        u, dt, d = inputs
+        x_next = dynamics_step(x, u, params, dt, d, integrator, dist_acc)
         return x_next, x_next
 
-    # Use JAX's scan to efficiently compute the trajectory
-    _, outputs = jax.lax.scan(step_fn, x0, U)
-
-    # return missing initial state x0 at the beginning of the trajectory
+    _, outputs = jax.lax.scan(step_fn, x0, (U, dts, disc))
     return jnp.vstack((x0, outputs))
+
+
+def time_grid(dt: float, n_fine: int, n_coarse: int = 0, coarse_factor: int = 3) -> NDArray:
+    """Step lengths of a horizon with `n_fine` steps of `dt` followed by `n_coarse` longer steps.
+
+    The coarse steps are an integer multiple of `dt`, so every knot falls onto the control rate and
+    the time-indexed reference can be sampled without interpolation.
+
+    Returns:
+        The step lengths with shape (n_fine + n_coarse,).
+    """
+    return np.array([dt] * n_fine + [coarse_factor * dt] * n_coarse, dtype=np.float32)
+
+
+def shift_controls(U: Array, dts: Array, shift: float) -> Array:
+    """Shift a control sequence on a (possibly non-uniform) grid forward in time by `shift`.
+
+    Input `k` starts at `t_k = sum(dts[:k])`. The shifted sequence holds the input of the original
+    piecewise-constant sequence at `t_k + shift`, i.e. at the start of each new step. On a uniform
+    grid with `shift = dt` this drops the first input and repeats the last one.
+    """
+    t = jnp.concatenate((jnp.zeros(1), jnp.cumsum(dts)[:-1]))
+    # Tolerance of a quarter of the shortest step against rounding in the cumulative sum
+    tol = 0.25 * jnp.min(dts)
+    idx = jnp.clip(jnp.searchsorted(t, t + shift + tol, side="right") - 1, 0, len(dts) - 1)
+    return U[idx]
 
 
 COST_CONSTANTS = {
@@ -109,6 +233,9 @@ COST_CONSTANTS = {
     "gate_slab": 0.1,  # Half-thickness in meters around a gate's plane in which the gate is checked
     "gate_frame_limit": 0.45,  # Offset in meters from the gate's center beyond which the frame is cleared
     "obstacle_radius": 0.2,  # Radius in meters of the penalty tube around an obstacle
+    "gate_crossing_scale": 4.0,  # Weight of one plane crossing relative to one state in the slab
+    "contour_tolerance": 0.1,  # Tolerance in meters for the distance to the path (contouring cost)
+    "gate_bonus_radius": 0.12,  # Max. offset in meters from the gate's center for the gate bonus
 }
 
 COST_WEIGHTS = {
@@ -117,6 +244,11 @@ COST_WEIGHTS = {
     "smoothness_weight": 0.01,  # Weight for control smoothness
     "gate_weight": 100.0,  # Weight for gate pass / collision / miss
     "obstacle_weight": 50.0,  # Weight for coming close to an obstacle
+    # Contouring cost, used if `cost_mode` is "contouring" or "hybrid"
+    "contour_weight": 0.2,  # Weight for the distance to the path
+    "progress_weight": 10.0,  # Reward per meter of progress at the end of the horizon
+    "speed_cap_weight": 1.0,  # Weight for exceeding the speed profile
+    "gate_bonus_weight": 20.0,  # Reward for crossing the next gate near its center
 }
 
 DEFAULT_PARAMS = {
@@ -125,6 +257,27 @@ DEFAULT_PARAMS = {
     "sigma": [0.9, 0.9, 0.0, 0.3],  # noise std: roll, pitch, yaw (rad), thrust (N)
     "target_ess": 0.05,  # fraction of samples that should effectively contribute to the update
     "rng_seed": 0,  # seed of the sampling noise
+    # Sampling (roadmap item 1)
+    "noise_beta": 0.0,  # AR(1) coefficient of temporally smoothed noise, 0 for white noise
+    "truncated": False,  # truncated-normal sampling within the action limits instead of clipping
+    "include_nominal": False,  # always include the unperturbed nominal and a hover sequence
+    "nan_guard": False,  # replace NaN or inf rollout costs with a large constant
+    # Horizon (roadmap item 2): `horizon` steps of 1 / freq, then `n_coarse` steps of
+    # `coarse_factor` / freq
+    "n_coarse": 0,
+    "coarse_factor": 3,
+    "integrator": "euler",  # "euler", "exact" or "rk4", see `dynamics_step`
+    "gate_mode": "slab",  # "slab", "crossing" or "both", see `trajectory_cost`
+    # Disturbance estimate (roadmap item 3): low-pass filter of the gap between the observed and
+    # the predicted velocity change, fed to the rollouts as a constant acceleration
+    "dist_alpha": 0.0,  # filter gain per control step in (0, 1], 0 disables the estimate
+    "dist_max": 3.0,  # limit of the estimate per axis in m/s^2
+    "dist_axes": [1.0, 1.0, 1.0],  # mask of the estimated axes (x, y, z)
+    # Progress-based cost (roadmap item 4)
+    "cost_mode": "tracking",  # "tracking", "contouring" or "hybrid", see `trajectory_cost`
+    "path_window": 6.0,  # length in meters of the path window ahead of the current progress
+    "path_behind": 0.5,  # length in meters of the path window behind the current progress
+    "path_ds": 0.05,  # spacing in meters of the path window's points
 }
 
 MLC_CONSTANTS = {
@@ -148,6 +301,10 @@ def trajectory_cost(
     sigma: Array,
     cc: dict,
     cw: dict,
+    w: Array,
+    gate_mode: str = "slab",
+    path: dict | None = None,
+    cost_mode: str = "tracking",
 ) -> Array:
     """Compute the cost of a single rollout.
 
@@ -164,6 +321,18 @@ def trajectory_cost(
         sigma: Standard deviation of the control input with shape (4,).
         cc: Cost constants, see `COST_CONSTANTS`.
         cw: Cost weights, see `COST_WEIGHTS`.
+        w: Weight of every state with shape (H + 1,), the length of its step in control periods.
+            Running costs are weighted with it, so that a coarse step counts as much as the fine
+            steps it replaces.
+        gate_mode: How the gates are checked. "slab": every state within `gate_slab` of a gate's
+            plane must be near its center. "crossing": every segment between two states that
+            crosses a gate's plane must cross it near the center; this cannot be skipped by long
+            steps. "both": the sum of the two.
+        path: Window of the path around the current progress for the progress-based cost, see
+            `contouring_cost`. Only used if `cost_mode` is not "tracking".
+        cost_mode: "tracking": follow the time-indexed reference in position and velocity.
+            "contouring": stay close to the path, make progress along it and stay below the speed
+            profile, see `contouring_cost`. "hybrid": both.
 
     Returns:
         The scalar cost.
@@ -173,12 +342,12 @@ def trajectory_cost(
     ref_pos = ref[:, :3]  # Extract reference positions
     tol = jnp.maximum(1e-6, cc["deviation_tolerance"])
     pos_error_per_step = jnp.square((pos - ref_pos) / tol)  # Compute per-step position error
-    deviation_cost = jnp.sum(pos_error_per_step)
+    deviation_cost = jnp.sum(w[:, None] * pos_error_per_step)
 
     # Deviation from the reference velocity, so the speed profile (e.g. slowing before gates) is followed
     vel_tol = jnp.maximum(1e-6, cc["velocity_tolerance"])
     vel_error_per_step = jnp.square((X[:, 6:9] - ref[:, 3:6]) / vel_tol)
-    velocity_cost = jnp.sum(vel_error_per_step)
+    velocity_cost = jnp.sum(w[:, None] * vel_error_per_step)
 
     # Cost for control smoothness
     U_including_prev = jnp.vstack(
@@ -212,23 +381,118 @@ def trajectory_cost(
     distance_further_than_tolerance = jnp.maximum(
         gate_plane_max_distance / cc["gate_tolerance"] - 1, 0
     )
-    gate_cost = jnp.sum(jnp.where(frame_mask, distance_further_than_tolerance**2, 0))
+    gate_cost = 0.0
+    if gate_mode in ("slab", "both"):
+        slab_cost = jnp.where(frame_mask, distance_further_than_tolerance**2, 0)
+        gate_cost += jnp.sum(w[:, None] * slab_cost)
+    if gate_mode in ("crossing", "both"):
+        # segments whose ends lie on different sides of a gate's plane, shape (H, n_gates)
+        d0, d1 = distance[:-1], distance[1:]
+        crosses = d0 * d1 < 0
+        frac = d0 / jnp.where(crosses, d0 - d1, 1.0)  # where along the segment the plane is hit
+        hit = gate_offset[:-1] + frac[..., None] * (gate_offset[1:] - gate_offset[:-1])
+        hit_h = jnp.sum(hit * jnp.cross(gate_normal, jnp.array([0, 0, 1]))[None, :, :], axis=-1)
+        hit_max = jnp.maximum(jnp.abs(hit[..., 2]), jnp.abs(hit_h))
+        on_frame = crosses & (hit_max < cc["gate_frame_limit"])
+        miss = jnp.maximum(hit_max / cc["gate_tolerance"] - 1, 0) ** 2
+        # a crossing replaces the ~4 states that the slab checks at 2.5 m/s and 50 Hz
+        gate_cost += cc["gate_crossing_scale"] * jnp.sum(jnp.where(on_frame, miss, 0))
 
     # Cost for coming close to an obstacle: tube around each pole, checked in the x-y plane
     obstacle_xy_distance = jnp.linalg.norm(pos[:, None, :2] - obstacles_pos[None, :, :2], axis=-1)
     # 0 outside the tube radius, rising to 1 at the pole's axis
     tube_penetration = jnp.maximum(1 - obstacle_xy_distance / cc["obstacle_radius"], 0)
-    obstacle_cost = jnp.sum(tube_penetration**2)
+    obstacle_cost = jnp.sum(w[:, None] * tube_penetration**2)
 
     total_cost = (
-        cw["deviation_weight"] * deviation_cost
-        + cw["velocity_weight"] * velocity_cost
-        + cw["smoothness_weight"] * smoothness_cost
+        cw["smoothness_weight"] * smoothness_cost
         + cw["gate_weight"] * gate_cost
         + cw["obstacle_weight"] * obstacle_cost
-    )  # Add other cost components if needed
+    )
+    if cost_mode in ("tracking", "hybrid"):
+        total_cost = (
+            cw["deviation_weight"] * deviation_cost
+            + cw["velocity_weight"] * velocity_cost
+            + total_cost
+        )
+    if cost_mode in ("contouring", "hybrid"):
+        total_cost += contouring_cost(X, path, cc, cw, w)
 
     return total_cost
+
+
+PROJ_BEHIND = 3  # path points behind the previous state's point searched for the next state
+PROJ_AHEAD = 13  # path points ahead of it, i.e. 0.65 m reach per step at 0.05 m spacing
+
+
+def contouring_cost(X: Array, path: dict, cc: dict, cw: dict, w: Array) -> Array:
+    """Progress-based cost: stay near the path, advance along it, pass the next gate.
+
+    The path is a window of points sampled densely along the reference path around the current
+    progress. The states are projected one after the other, each onto the nearest of the path
+    points just behind or ahead of the previous state's point, and then along that point's tangent.
+
+    Terms:
+        contour: squared distance to the path over `contour_tolerance`, weighted per state.
+        progress: reward for the progress of the last state beyond the current progress, in m.
+        speed cap: squared speed above the mid-level speed profile at the state's progress. The
+            profile slows down before unrevealed gates and in tight turns; as a cap instead of a
+            target, the drone may go slower but not faster.
+        gate bonus: reward for crossing the next gate's plane in its passing direction within
+            `gate_bonus_radius` of its center. A sparse reward alone fails because most rollouts do
+            not reach the next gate within the horizon, so it complements the dense progress term.
+
+    Args:
+        X: State trajectory with shape (H + 1, 13).
+        path: Dict with `pts` (N, 3), `tangent` (N, 3) unit tangents, `s` (N,) progress, `v_cap`
+            (N,) speed profile, `s0` () current progress, `i0` () index of the point at the current
+            progress (where the projection of the first state starts), `gate` (6,) position and passing
+            direction of the next gate, and `gate_valid` () 1 if there is a next gate, else 0.
+        cc: Cost constants.
+        cw: Cost weights.
+        w: Weight of every state with shape (H + 1,).
+
+    Returns:
+        The scalar cost.
+    """
+    pos, vel = X[:, :3], X[:, 6:9]
+    n_pts = path["pts"].shape[0]
+    candidates = jnp.arange(PROJ_BEHIND + PROJ_AHEAD) - PROJ_BEHIND
+
+    def project(i_prev: Array, p: Array) -> tuple[Array, Array]:
+        # Search only near the previous state's path point, so the progress stays continuous and
+        # cannot jump to a later section of the track that passes close by (shortcuts)
+        idx = jnp.clip(i_prev + candidates, 0, n_pts - 1)
+        i = idx[jnp.argmin(jnp.sum((path["pts"][idx] - p) ** 2, axis=-1))]
+        return i, i
+
+    _, j = jax.lax.scan(project, path["i0"], pos)
+    offset = pos - path["pts"][j]
+    along = jnp.sum(offset * path["tangent"][j], axis=-1)
+    lateral = offset - along[:, None] * path["tangent"][j]
+    s = path["s"][j] + along
+    contour = jnp.sum(w * jnp.sum(lateral**2, axis=-1)) / cc["contour_tolerance"] ** 2
+    progress = s[-1] - path["s0"]
+    speed_excess = jnp.maximum(jnp.linalg.norm(vel, axis=-1) - path["v_cap"][j], 0.0)
+    speed_cap = jnp.sum(w * speed_excess**2)
+
+    # Bonus for crossing the next gate's plane forward near its center
+    g_pos, g_dir = path["gate"][:3], path["gate"][3:]
+    rel = pos - g_pos
+    d = rel @ g_dir
+    forward = (d[:-1] < 0) & (d[1:] >= 0)
+    frac = d[:-1] / jnp.where(forward, d[:-1] - d[1:], 1.0)
+    hit = rel[:-1] + frac[:, None] * (rel[1:] - rel[:-1])
+    hit_lat = hit - (hit @ g_dir)[:, None] * g_dir  # component in the gate's plane
+    inside = forward & (jnp.max(jnp.abs(hit_lat), axis=-1) < cc["gate_bonus_radius"])
+    bonus = path["gate_valid"] * jnp.any(inside)
+
+    return (
+        cw["contour_weight"] * contour
+        - cw["progress_weight"] * progress
+        + cw["speed_cap_weight"] * speed_cap
+        - cw["gate_bonus_weight"] * bonus
+    )
 
 
 def adaptive_lambda(costs: Array, target_ess: float, n_iter: int = 30) -> Array:
@@ -328,6 +592,61 @@ def speed_to_rgba(speed: NDArray, alpha: float = 1.0) -> NDArray:
     return np.stack((s, 1 - np.abs(2 * s - 1), 1 - s, np.full_like(s, alpha)), axis=-1)
 
 
+NAN_COST = 1e9  # cost given to rollouts whose cost is NaN or inf
+
+
+class MPPIOptions(NamedTuple):
+    """Static options of the MPPI update. Changing one recompiles the update."""
+
+    n_samples: int  # number of sampled control sequences
+    noise_beta: float = 0.0  # AR(1) coefficient of the temporally smoothed noise, 0 for white noise
+    truncated: bool = (
+        False  # sample from a normal truncated to the action limits instead of clipping
+    )
+    include_nominal: bool = False  # always include the unperturbed nominal and a hover sequence
+    nan_guard: bool = False  # replace NaN or inf rollout costs with NAN_COST
+    integrator: str = "euler"  # see `dynamics_step`
+    gate_mode: str = "slab"  # see `trajectory_cost`
+    use_dist: bool = False  # add the estimated disturbance acceleration in the rollouts
+    cost_mode: str = "tracking"  # see `trajectory_cost`
+
+
+def sample_actions(
+    key: Array, U_nom: Array, sigma: Array, lo: Array, hi: Array, opts: MPPIOptions
+) -> Array:
+    """Sample perturbed control sequences around `U_nom` within the action limits.
+
+    White noise is i.i.d. normal per step. Smoothed noise is an AR(1) process per sample and channel,
+    `e_t = beta * e_(t-1) + sqrt(1 - beta^2) * w_t`, which keeps the marginal standard deviation at
+    `sigma` while correlating neighboring steps. Truncated sampling draws white noise from a normal
+    truncated to the limits, so no probability mass piles up at the limits as with clipping. Smoothed
+    noise is clipped, because a filtered truncated normal is not truncated anymore.
+
+    Returns:
+        The sampled sequences with shape (n_samples, H, 4).
+    """
+    shape = (opts.n_samples, *U_nom.shape)
+    beta = opts.noise_beta
+    if opts.truncated and beta == 0.0:
+        safe_sigma = jnp.where(sigma > 0, sigma, 1.0)  # channels without noise (yaw) stay at U_nom
+        lower, upper = (lo - U_nom) / safe_sigma, (hi - U_nom) / safe_sigma
+        # Guard against a nominal sequence on or past a limit, where the interval would be empty
+        lower, upper = jnp.minimum(lower, -1e-3), jnp.maximum(upper, 1e-3)
+        noise = jax.random.truncated_normal(key, lower, upper, shape, dtype=jnp.float32)
+    else:
+        noise = jax.random.normal(key, shape, dtype=jnp.float32)
+        if beta > 0.0:
+
+            def ar1(prev: Array, w: Array) -> tuple[Array, Array]:
+                e = beta * prev + jnp.sqrt(1 - beta**2) * w
+                return e, e
+
+            noise_t = jnp.swapaxes(noise, 0, 1)  # (H, n_samples, 4), scanned over time
+            _, filtered = jax.lax.scan(ar1, noise_t[0], noise_t[1:])
+            noise = jnp.swapaxes(jnp.concatenate((noise_t[:1], filtered)), 0, 1)
+    return jnp.clip(U_nom + sigma * noise, lo, hi)
+
+
 def mppi_update(
     key: Array,
     x0: Array,
@@ -337,12 +656,14 @@ def mppi_update(
     gates: Array,
     obstacles_pos: Array,
     params: dict,
-    dt: float,
-    n_samples: int,
+    grid: dict,
     sigma: Array,
     target_ess: float,
     cc: dict,
     cw: dict,
+    opts: MPPIOptions,
+    dist_acc: Array | None = None,
+    path: dict | None = None,
 ) -> tuple[Array, Array, Array, Array, Array, Array]:
     """Perform one MPPI iteration.
 
@@ -359,12 +680,15 @@ def mppi_update(
         gates: Position and normal vector of every gate with shape (n_gates, 6).
         obstacles_pos: Obstacle positions with shape (n_obstacles, 3).
         params: Drone parameters.
-        dt: Integration step in seconds.
-        n_samples: Number of sampled control sequences.
+        grid: Time grid of the horizon: `dts` (H,) step lengths, `w` (H + 1,) cost weight of every
+            state, and `disc`, the discretization of every step (see `discretize`).
         sigma: Per-channel standard deviation of the sampling noise with shape (4,).
         target_ess: Desired effective sample size as a fraction of n_samples.
         cc: Cost constants, see `COST_CONSTANTS`.
         cw: Cost weights, see `COST_WEIGHTS`.
+        opts: Static options (shapes and feature switches), see `MPPIOptions`.
+        dist_acc: Estimated disturbance acceleration with shape (3,), used if `opts.use_dist`.
+        path: Path window for the contouring cost, see `contouring_cost`.
 
     Returns:
         - U_new: The updated nominal control sequence with shape (H, 4).
@@ -377,31 +701,54 @@ def mppi_update(
         - mean_path: Positions of the rollout of `U_new` with shape (H + 1, 3).
 
     """
-    samples = jax.random.normal(key, (n_samples, len(U_nom), 4), dtype=jnp.float32)
-    samples *= sigma
-    sampled_actions = U_nom + samples
-
-    # clip attitude and total thrust
-    sampled_actions = jnp.clip(
-        sampled_actions,
-        jnp.array([-1.0, -1.0, -1.0, 4 * params["thrust_min"]]),
-        jnp.array([1.0, 1.0, 1.0, 4 * params["thrust_max"]]),
-    )
+    n_samples = opts.n_samples
+    lo = jnp.array([-1.0, -1.0, -1.0, 4 * params["thrust_min"]])
+    hi = jnp.array([1.0, 1.0, 1.0, 4 * params["thrust_max"]])
+    sampled_actions = sample_actions(key, U_nom, sigma, lo, hi, opts)
+    if opts.include_nominal:
+        # The unperturbed nominal sequence and hovering are always candidates, so the update can
+        # keep the current plan or stop if every perturbation is worse
+        hover = (params["mass"] * -params["gravity_vec"][-1] - params["acc_coef"]) / params[
+            "cmd_f_coef"
+        ]
+        hover_seq = jnp.zeros_like(U_nom).at[:, 3].set(hover)
+        sampled_actions = sampled_actions.at[0].set(U_nom).at[1].set(hover_seq)
 
     # define batch functions
-    rollout_jit = jax.jit(rollout)
-    rollout_batch_of_trajectories = jax.vmap(rollout_jit, in_axes=(None, 0, None, None))
+    dts, disc, w = grid["dts"], grid["disc"], grid["w"]
 
-    cost_jit = jax.jit(trajectory_cost)
-    trajectory_cost_for_batch = jax.vmap(
-        cost_jit, in_axes=(0, 0, None, None, None, None, None, None, None)
-    )
+    dist = dist_acc if opts.use_dist else None
 
-    rollouts = rollout_batch_of_trajectories(x0, sampled_actions, params, dt)
+    def rollout_one(U: Array) -> Array:
+        return rollout(x0, U, params, dts, disc, opts.integrator, dist)
 
-    costs = trajectory_cost_for_batch(
-        rollouts, sampled_actions, u_prev, ref, gates, obstacles_pos, sigma, cc, cw
-    )
+    rollout_batch_of_trajectories = jax.vmap(rollout_one)
+
+    def cost_one(X: Array, U: Array) -> Array:
+        return trajectory_cost(
+            X,
+            U,
+            u_prev,
+            ref,
+            gates,
+            obstacles_pos,
+            sigma,
+            cc,
+            cw,
+            w,
+            opts.gate_mode,
+            path,
+            opts.cost_mode,
+        )
+
+    trajectory_cost_for_batch = jax.vmap(cost_one)
+
+    rollouts = rollout_batch_of_trajectories(sampled_actions)
+
+    costs = trajectory_cost_for_batch(rollouts, sampled_actions)
+    if opts.nan_guard:
+        # A diverged rollout must not poison the softmin: give it a large finite cost instead
+        costs = jnp.where(jnp.isfinite(costs), costs, NAN_COST)
 
     # weighting the runs by costs
     lam = adaptive_lambda(costs, target_ess)
@@ -419,7 +766,7 @@ def mppi_update(
     vis_pos = rollouts[vis_idx, :, :3]
     vis_weights = weights[vis_idx]
     # Predicted path of the chosen mean action sequence
-    mean_path = rollout(x0, U_new, params, dt)[:, :3]
+    mean_path = rollout_one(U_new)[:, :3]
 
     return U_new, ess, lam, vis_pos, vis_weights, mean_path
 
@@ -478,7 +825,19 @@ class AttitudeMPPI(Controller):
 
         self._freq = config.env.freq
         self._dt = 1 / self._freq
-        self._horizon = int(p["horizon"])  # planning steps, 0.5 s at 50 Hz
+        # Time grid: `horizon` steps of 1 / freq, then `n_coarse` steps of `coarse_factor` / freq
+        factors = np.array([1] * int(p["horizon"]) + [int(p["coarse_factor"])] * int(p["n_coarse"]))
+        self._dts = time_grid(
+            self._dt, int(p["horizon"]), int(p["n_coarse"]), int(p["coarse_factor"])
+        )
+        self._horizon = len(self._dts)  # number of planning steps
+        # Index of every knot in the reference sampled at the control rate, shape (H + 1,)
+        self._knot_idx = np.concatenate(([0], np.cumsum(factors)))
+        self._grid = {
+            "dts": jnp.asarray(self._dts),
+            "w": jnp.asarray(np.concatenate(([1], factors)), dtype=jnp.float32),
+            "disc": None,  # set below, once the drone parameters are loaded
+        }
         self._n_samples = int(p["n_samples"])  # sampled control sequences per step
         self._sigma = jnp.asarray(p["sigma"], dtype=jnp.float32)  # noise std: r, p, y, thrust
         # fraction of samples that should effectively contribute to the update
@@ -486,6 +845,7 @@ class AttitudeMPPI(Controller):
         self._step_ms = []  # wall time of every MPPI update, for benchmarking
         self._lam = float("nan")  # softmin temperature, adapted every step to reach the target ESS
         self._params = load_params(Dynamics.so_rpy_rotor_drag, config.sim.drone)
+        self._grid["disc"] = discretize(self._params, self._dts)
         # Hover command, inverted from force = acc_coef + cmd_f_coef * cmd
         self._hover_thrust = float(
             (self._params["mass"] * -self._params["gravity_vec"][-1] - self._params["acc_coef"])
@@ -503,8 +863,40 @@ class AttitudeMPPI(Controller):
             gate_plateau=mlc["gate_plateau"],
         )
 
-        # n_samples fixes an array shape, so it must be static for jit
-        self._update = jax.jit(mppi_update, static_argnames=("n_samples",))
+        # Shapes and feature switches are static for jit
+        self._opts = MPPIOptions(
+            n_samples=self._n_samples,
+            noise_beta=float(p["noise_beta"]),
+            truncated=bool(p["truncated"]),
+            include_nominal=bool(p["include_nominal"]),
+            nan_guard=bool(p["nan_guard"]),
+            integrator=str(p["integrator"]),
+            gate_mode=str(p["gate_mode"]),
+            use_dist=float(p["dist_alpha"]) > 0,
+            cost_mode=str(p["cost_mode"]),
+        )
+        n_window = int(round((p["path_window"] + p["path_behind"]) / p["path_ds"])) + 1
+        self._path_offsets = p["path_ds"] * np.arange(n_window) - p["path_behind"]
+        # Disturbance estimate and the one-step prediction it is updated from
+        self._dist_alpha = float(p["dist_alpha"])
+        self._dist_max = float(p["dist_max"])
+        self._dist_axes = np.asarray(p["dist_axes"], dtype=np.float32)
+        self._dist = np.zeros(3, dtype=np.float32)
+        self._dist_log = []  # estimate at every step, for diagnostics
+        self._vel_pred = None  # velocity predicted for the next observation
+        # The ground holds the drone before takeoff, which the model does not know about, so the
+        # estimate is only updated once the drone is airborne
+        self._z_takeoff = float(obs["pos"][2]) + 0.05
+
+        def predict_vel(x: Array, u: Array, dist_acc: Array) -> Array:
+            disc0 = jax.tree.map(lambda a: a[0], self._grid["disc"])
+            dt0 = self._grid["dts"][0]
+            return dynamics_step(x, u, self._params, dt0, disc0, self._opts.integrator, dist_acc)[
+                6:9
+            ]
+
+        self._predict_vel = jax.jit(predict_vel)
+        self._update = jax.jit(mppi_update, static_argnames=("opts",))
         self._key = jax.random.key(int(p["rng_seed"]))
         # Warm start: hold hover thrust with level attitude
         self._U_nom = jnp.tile(jnp.array([0.0, 0.0, 0.0, self._hover_thrust]), (self._horizon, 1))
@@ -519,7 +911,7 @@ class AttitudeMPPI(Controller):
         self._obstacle_now = None  # positions of the currently perceived obstacles
         self._obstacle_old = []  # per obstacle, the positions perceived before the current one
 
-        self._ref = self._mlc.get_trajectory(obs, self._horizon, self._dt)
+        self._ref = self._reference(obs)
 
         # Warm-up call so the jit compilation happens here and not in the first control step
         jax.block_until_ready(self._run_update(self._key, obs))
@@ -535,13 +927,52 @@ class AttitudeMPPI(Controller):
             self._get_gates_pos_and_normal(obs),
             jnp.asarray(obs["obstacles_pos"]),
             self._params,
-            self._dt,
-            self._n_samples,
+            self._grid,
             self._sigma,
             self._target_ess,
             self._cc,
             self._cw,
+            opts=self._opts,
+            dist_acc=jnp.asarray(self._dist),
+            path=self._path_window(obs) if self._opts.cost_mode != "tracking" else None,
         )
+
+    def _reference(self, obs: dict[str, NDArray[np.floating]]) -> NDArray:
+        """Sample the mid-level reference at the knots of the time grid, shape (H + 1, 6)."""
+        ref = self._mlc.get_trajectory(obs, int(self._knot_idx[-1]), self._dt)
+        return ref[self._knot_idx]
+
+    def _path_window(self, obs: dict[str, NDArray[np.floating]]) -> dict:
+        """Sample the reference path and its speed profile around the current progress."""
+        ref = self._mlc._planner._current_reference
+        s0 = float(self._mlc._current_progress)
+        s = np.clip(s0 + self._path_offsets, 0.0, ref.length)
+        pts = ref.path(s)
+        tangent = ref.path(s, 1)
+        tangent /= np.maximum(np.linalg.norm(tangent, axis=-1, keepdims=True), 1e-9)
+        profile = self._mlc._current_velocity_profile
+        v_cap = profile[np.clip(np.searchsorted(ref.path.x, s), 0, len(profile) - 1)]
+        n_passed = int(obs["n_gates_passed"])
+        n_gates = len(obs["gate_sequence"])
+        gate_valid = n_passed < n_gates
+        gate = np.zeros(6)
+        if gate_valid:
+            i = int(obs["gate_sequence"][n_passed])
+            normal = R.from_quat(obs["gates_quat"][i]).apply([1.0, 0.0, 0.0])
+            gate = np.concatenate(
+                (obs["gates_pos"][i], normal * obs["gate_sequence_direction"][n_passed])
+            )
+        f32 = jnp.float32
+        return {
+            "pts": jnp.asarray(pts, dtype=f32),
+            "tangent": jnp.asarray(tangent, dtype=f32),
+            "s": jnp.asarray(s, dtype=f32),
+            "v_cap": jnp.asarray(v_cap, dtype=f32),
+            "s0": jnp.asarray(s0, dtype=f32),
+            "i0": jnp.asarray(int(np.argmin(np.abs(s - s0))), dtype=jnp.int32),
+            "gate": jnp.asarray(gate, dtype=f32),
+            "gate_valid": jnp.asarray(float(gate_valid), dtype=f32),
+        }
 
     def _state(self, obs: dict[str, NDArray[np.floating]]) -> Array:
         """Convert an observation to the planning state [pos, rpy, vel, drpy, thrust]."""
@@ -567,9 +998,10 @@ class AttitudeMPPI(Controller):
         if self._mlc._current_progress >= self._mlc._planner._current_reference.length:
             self._finished = True
 
-        self._ref = self._mlc.get_trajectory(obs, self._horizon, self._dt)
+        self._ref = self._reference(obs)
         self._track_gate_perception(obs)
         self._track_obstacle_perception(obs)
+        self._update_disturbance(obs)
 
         # Fresh noise every step: split the key, keep one half and use the other
         self._key, subkey = jax.random.split(self._key)
@@ -583,14 +1015,33 @@ class AttitudeMPPI(Controller):
         self._vis = (np.asarray(vis_pos), np.asarray(vis_weights), np.asarray(mean_path))
 
         self._u_prev = U_new[0]
-        # Shift by one step for the next call and repeat the last input to fill the end
-        self._U_nom = jnp.concatenate((U_new[1:], U_new[-1:]))
+        # Shift by one control period for the next call (on a uniform grid: drop the first input
+        # and repeat the last one)
+        self._U_nom = shift_controls(U_new, self._grid["dts"], self._dt)
         # Only the first input is applied, the rest is re-planned at the next step
         action = np.asarray(U_new[0], dtype=np.float32)
         # Propagate the thrust estimate with the same first-order lag the model uses
+        x_now = self._state(obs)  # with the thrust estimate before this command's lag is applied
         thrust_dyn_coef = float(self._params["thrust_dyn_coef"])
         self._thrust += thrust_dyn_coef * (action[3] - self._thrust) * self._dt
+        if self._dist_alpha > 0:
+            self._vel_pred = np.asarray(
+                self._predict_vel(x_now, jnp.asarray(action), jnp.asarray(self._dist))
+            )
         return action
+
+    def _update_disturbance(self, obs: dict[str, NDArray[np.floating]]):
+        """Low-pass filter the velocity prediction error into a constant disturbance acceleration.
+
+        The prediction of the last step already contains the current estimate, so its error is the
+        part of the disturbance that is not yet explained: `d += alpha * (v_obs - v_pred) / dt`.
+        """
+        if self._dist_alpha <= 0 or self._vel_pred is None or obs["pos"][2] < self._z_takeoff:
+            return
+        residual = (np.asarray(obs["vel"]) - self._vel_pred) / self._dt
+        self._dist = self._dist + self._dist_alpha * self._dist_axes * residual
+        self._dist = np.clip(self._dist, -self._dist_max, self._dist_max).astype(np.float32)
+        self._dist_log.append(self._dist.copy())
 
     def step_callback(
         self,
@@ -756,6 +1207,8 @@ class AttitudeMPPI(Controller):
         self._U_nom = jnp.tile(jnp.array([0.0, 0.0, 0.0, self._hover_thrust]), (self._horizon, 1))
         self._u_prev = self._U_nom[0]
         self._thrust = 0.0
+        self._dist = np.zeros(3, dtype=np.float32)
+        self._vel_pred = None
 
     def _get_gates_pos_and_normal(self, obs: dict[str, NDArray[np.floating]]) -> Array:
         """Return the position and the normal vector of every gate with shape (n_gates, 6)."""
