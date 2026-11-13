@@ -389,6 +389,125 @@ Spot check on seed 1: with `v_gate_max` 4 the drone reaches gate 3 too fast for 
 overshoots it by 0.5 m, also with the 1.0 s horizon; with 3 m/s all gates are passed in ~5.5 s. The
 grid below screens the lateral limit against the gate cap in closed loop.
 
+### Speed grid (100 episodes, rng 0, `short_best` with a_long = a_brake = 10)
+
+| a_lat \ v_gate_max | 2.0 m/s | 2.5 m/s | 3.0 m/s |
+|---|---|---|---|
+| 8 | 95 %, 5.53 s | 78 %, 5.32 s | 66 %, 5.23 s |
+| 10 | 69 %, 5.47 s | 60 %, 5.22 s | 49 %, 5.11 s |
+| 12 | 46 %, 5.42 s | 42 %, 5.21 s | 24 %, 5.08 s |
+
+`sb_fast3` (a_lat 10, v_gate_max 4, profile 4.08 s) 40 %, 5.00 s; `sb_fast4` (a_lat 12, profile 3.77 s)
+16 %, 5.00 s; `u50b_fast2` (1.0 s horizon + gate bonus on a_lat 10, v_gate_max 3) 35 %, 5.48 s.
+
+Two failure modes take over:
+
+- A higher **gate cap** causes gate collisions: the gate's true position is revealed too late to
+  correct at 3–4 m/s.
+- A higher **lateral limit** causes missed gates: the drone overshoots a turn by 0.3–0.5 m and passes
+  just outside `gate_frame_limit` (0.45 m), where the gate cost is zero.
+
+Above a_lat ≈ 9 the profiles promise 4.1–3.8 s but are flown in ~5.0 s. From there the controller is
+the limit, not the reference.
+
+Confirmation on 300 episodes (compared with `short_best`, 287, 6.170 s):
+
+| variant | success | t mean | Δt paired | failures (gate/miss/obst) |
+|---|---|---|---|---|
+| `sb_lat7_vg20` | **285 (95.0 %)** | **5.633** | **−0.538** | 7/4/4 |
+| `sb_lat8_vg20` | 281 (93.7 %) | 5.532 | −0.643 | 4/8/7 |
+| `sb_lat9_vg20` | 253 (84.3 %) | 5.460 | −0.717 | 4/38/5 |
+
+The overshoot at a_lat 9 (`diagnose.py --seed=4 --variant=sb_lat9_vg20`, last turn into the second
+pass of gate 2):
+
+- The gate bonus does not fix it (`sb_lat9_bonus`: seeds 4, 6 and 18 still miss).
+- The inputs are not saturated (max |roll| 0.95 rad, thrust 95 %).
+- The cause is not isolated yet. Candidates: model error at high tilt and speed, the tracking-cost
+  weights at speed, or the attitude response lag. Another lever: the profile caps lateral and
+  longitudinal acceleration separately, so a combined limit, a_lat² + a_long² ≤ a_max², would keep
+  braking out of the tightest part of a turn.
+
+## Step 6 — GPU
+
+`pixi install -e gpu`, then run the harness or `timing.py` with
+`JAX_PLATFORMS=cuda,cpu XLA_PYTHON_CLIENT_PREALLOCATE=false .pixi/envs/gpu/bin/python ...`. The
+simulator needs the CPU backend, so `cuda` alone fails. RTX 4080 SUPER.
+
+### Timing on the idle machine (`benchmarks/mppi/timing.py`, 200 steps)
+
+| device | variant | samples | update median | update p95 | full step median |
+|---|---|---|---|---|---|
+| CPU | baseline | 1024 | 6.5 ms | 7.1 ms | 8.5 ms |
+| CPU | baseline | 4096 | 29.1 ms | 35.0 ms | 31.8 ms |
+| CPU | default (new) | 1024 | 7.7 ms | 8.3 ms | 9.8 ms |
+| CPU | default (new) | 4096 | 36.2 ms | 43.5 ms | 39.2 ms |
+| CPU | `u50_dd_hybrid` | 1024 | 19.2 ms | 20.4 ms | 21.8 ms |
+| GPU | default (new) | 1024 | 2.9 ms | 3.1 ms | 7.4 ms |
+| GPU | default (new) | 4096 | 3.0 ms | 3.2 ms | 7.5 ms |
+| GPU | default (new) | 16384 | 3.7 ms | 3.9 ms | 8.2 ms |
+| GPU | default (new) | 65536 | 5.7 ms | 6.0 ms | 10.2 ms |
+| GPU | default (new) | 262144 | 18.1 ms | 18.5 ms | 22.8 ms |
+| GPU | `u50_dd_hybrid` | 1024 / 16384 / 65536 | 5.7 / 7.2 / 11.9 ms | | 10.4 / 11.9 / 16.7 ms |
+
+- The control period is 20 ms. On the CPU only ~1k samples fit, or the 1.0 s hybrid horizon at 1k.
+- On the GPU 16k samples cost about the same as 1k, and 65k still fit. The 1.0 s hybrid horizon
+  fits with up to 65k samples.
+- The full step costs 4.5 ms more than the update on the GPU and 2 ms more on the CPU. That is the
+  mid-level planner, the reference sampling and the host/device transfers, which the GPU cannot
+  speed up (see item 7).
+
+### Closed loop on the GPU (100 episodes, rng 0, compared with `gpu_sb` = `short_best` on the GPU)
+
+| variant | success | t mean | Δt paired | ms/step |
+|---|---|---|---|---|
+| `gpu_sb` (1024) | 94 | 6.166 | — | 3.5 |
+| `gpu_sb_4k` | **97** | 6.119 | −0.056 | 3.7 |
+| `gpu_sb_16k` | **97** | 6.107 | −0.067 | 6.9 |
+| `gpu_sb_16k_modes4` (4 × 4096) | 94 | 6.124 | −0.048 | 6.8 |
+| `gpu_sb_16k_sadapt` | 91 | 6.049 | −0.107 | 5.2 |
+| `gpu_sb_lat8` (1024) | 94 | 5.539 | −0.638 | 3.2 |
+| `gpu_sb_16k_lat8` | 90 | 5.472 | −0.703 | 6.4 |
+| `gpu_sb_lat10` (1024) | 65 | 5.448 | −0.762 | 3.3 |
+| `gpu_sb_16k_lat10` | 56 | 5.388 | −0.857 | 6.5 |
+| `gpu_sb_16k_lat8_vg25` | 78 | 5.242 | −0.903 | 6.2 |
+
+Reading:
+
+- **4k samples help a little** (+3 successes, −0.06 s, with no loss on any seed). 16k bring nothing
+  more.
+- **More samples do not make the fast profiles feasible**: at a_lat 10 the 16k run misses even more
+  gates than the 1k run. So the overshoot is not an exploration problem, which points to the
+  model, the cost or the profile (see the speed grid above).
+- **Multi-modal MPPI recovers with enough samples** (4 × 256: −18 against the baseline on 300
+  episodes; 4 × 4096: equal to the 1-mode run) but does not beat one mode with the same samples. On
+  this track there is no second homotopy class that the single mode misses. Adaptive spread still
+  shrinks σ too much and hits more frames.
+
+## Step 7 — fully jitted closed loop: not done
+
+The mid-level planner (spline planner, speed profile, progress projection) is numpy/scipy code that
+runs on the host every step. A fully jitted loop needs it in JAX, which is exactly issue #13 ("Make
+High-Level Planner & Mid Level Planner JAX compatible"). This item is left to that issue. The
+timing above shows the gain to expect: the host side is 2 ms per step on the CPU and 4.5 ms on the
+GPU, more than the 16k-sample update itself. A jitted loop would also allow running thousands of
+episodes per minute on the GPU for tuning.
+
+## New defaults
+
+`DEFAULT_PARAMS` and `MLC_CONSTANTS` are now the best configuration (`sb_lat7_vg20`):
+
+- `integrator` "exact", `include_nominal` True, `discount_tau` 0.3, `dist_alpha` 0.05,
+  `dist_axes` [0, 0, 1];
+- mid-level `a_lat_max` 7, `a_long_max` 10, `a_brake_max` 10.
+
+Every other variant in `variants.py` is now defined relative to the old defaults (`OLD_DEFAULTS`,
+`OLD_MLC`). Re-running `check` reproduces the stored baseline exactly, and the new `default` variant
+reproduces `sb_lat7_vg20` exactly (285/300, 5.633 s, paired Δ 0.000 s).
+
+**Result: 285/300 (95.0 %) at 5.633 s, against 281/300 (93.7 %) at 6.164 s before: −0.53 s per lap
+with 4 more successes, at the same compute (CPU 9.8 ms per step).**
+
 ### Note on the benchmark machine
 
 Stopping a benchmark with `pkill` on the parent left its 8 workers running; together with a new
