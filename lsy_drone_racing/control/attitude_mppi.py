@@ -13,7 +13,7 @@ State and input conventions follow `attitude_mpc.py`, with the thrust state appe
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -21,7 +21,7 @@ import numpy as np
 from crazyflow.dynamics import Dynamics, load_params
 from crazyflow.dynamics.so_rpy_rotor_drag.dynamics import dynamics_euler
 from crazyflow.dynamics.utils.rotation import ang_vel2rpy_rates
-from crazyflow.sim.visualize import draw_line
+from crazyflow.sim import visualize
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 
@@ -245,6 +245,40 @@ def adaptive_lambda(costs: Array, target_ess: float, n_iter: int = 30) -> Array:
 GATE_OPENING_HALF = 0.2  # half width in meters of a gate's opening
 N_VIS_BEST = 10  # lowest-cost rollouts that are drawn
 N_VIS_RANDOM = 30  # additional evenly strided rollouts that are drawn
+VIS_MAX_GEOM = 4000  # geoms the viewer's scene can hold; every line segment and point is one geom
+
+
+def _free_geoms(sim: Sim) -> int:
+    """Return how many more markers fit into the viewer's scene this frame."""
+    viewer = getattr(sim.viewer, "viewer", None)
+    if viewer is None:
+        return 0
+    # The scene also holds the model's own geoms, and the markers queued so far for this frame
+    return viewer.scn.maxgeom - sim.mj_model.ngeom - len(viewer._markers)
+
+
+def draw_line(sim: Sim, points: NDArray, **kwargs: Any) -> bool:
+    """Draw a line like `crazyflow.sim.visualize.draw_line`, but skip it if the scene is full.
+
+    Returns:
+        True if the line was drawn, False if it was skipped.
+    """
+    if sim.viewer is None or _free_geoms(sim) < len(points) - 1:
+        return False
+    visualize.draw_line(sim, points, **kwargs)
+    return True
+
+
+def draw_points(sim: Sim, points: NDArray, **kwargs: Any) -> bool:
+    """Draw points like `crazyflow.sim.visualize.draw_points`, but skip them if the scene is full.
+
+    Returns:
+        True if the points were drawn, False if they were skipped.
+    """
+    if sim.viewer is None or _free_geoms(sim) < len(points):
+        return False
+    visualize.draw_points(sim, points, **kwargs)
+    return True
 
 
 def gate_outline(pos: NDArray, quat: NDArray, half: float) -> NDArray:
@@ -544,7 +578,15 @@ class AttitudeMPPI(Controller):
         return self._finished | int(obs["n_gates_passed"]) == len(obs["gate_sequence"])
 
     def render_callback(self, sim: Sim):
-        """Draw the reference by speed, the sampled rollouts by weight and the mean action path."""
+        """Draw the reference by speed, the sampled rollouts by weight and the mean action path.
+
+        Items that no longer fit into the viewer's scene are skipped, the rollouts first.
+        """
+        if sim.viewer is None:
+            # The viewer is created after the first callback and sizes its scene from this value
+            sim.max_visual_geom = max(sim.max_visual_geom, VIS_MAX_GEOM)
+            return
+
         # Reference path from high level planner
         ref_path, _ = self._mlc._planner._current_reference.sample_densely(num_samples=200)
         draw_line(sim, ref_path, rgba=(0.0, 1.0, 0.0, 1.0))
@@ -558,7 +600,6 @@ class AttitudeMPPI(Controller):
         self._draw_gate_perception(sim)
         self._draw_obstacle_perception(sim)
 
-        """
         if self._vis is None:
             return
         # Reference point the drone should be tracking right now
@@ -568,7 +609,10 @@ class AttitudeMPPI(Controller):
         # Rollout tree: opaque, thick and bright for high weight, faint and thin for low weight
         # (sqrt compresses the weights, which span orders of magnitude)
         w = np.sqrt(vis_weights / vis_weights.max())
+        reserved = 2 * len(mean_path)  # geoms kept free for the mean path's line and points
         for pos, wi in zip(vis_pos, w):
+            if _free_geoms(sim) - reserved < len(pos[::2]) - 1:
+                break  # the scene is full, so the remaining rollouts are left out
             draw_line(
                 sim,
                 pos[::2],
@@ -579,7 +623,6 @@ class AttitudeMPPI(Controller):
         # Chosen mean action sequence, drawn last so it is on top
         draw_line(sim, mean_path, rgba=(1.0, 0.0, 1.0, 1.0), start_size=4.5, end_size=4.5)
         draw_points(sim, mean_path, rgba=(1.0, 0.0, 1.0, 1.0), size=0.01)
-        """
 
     def _track_gate_perception(self, obs: dict[str, NDArray[np.floating]]):
         """Store the previously perceived pose of every gate whose observed pose just changed."""
