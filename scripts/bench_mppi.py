@@ -35,8 +35,8 @@ import numpy as np
 
 ROOT = Path(__file__).parents[1]
 # Episodes per worker process before it is replaced. A worker's memory grows with every episode
-# (about 2 GB after a few dozen), so recycling keeps the total bounded
-TASKS_PER_WORKER = 10
+# (2.5-3 GB after 10 with the long horizon), so recycling keeps the total bounded
+TASKS_PER_WORKER = 5
 RESULTS = ROOT / "benchmarks" / "mppi" / "results"
 logger = logging.getLogger("bench_mppi")
 
@@ -81,8 +81,25 @@ def classify(pos: np.ndarray, gates_pos: np.ndarray, obstacles_pos: np.ndarray) 
     return "gate" if d_gate < 0.7 else "other"
 
 
+MIN_AVAILABLE_GB = 4.0  # a worker waits before an episode while less memory is available
+
+
+def _available_gb() -> float:
+    """Available memory in GB from /proc/meminfo, or infinity where it does not exist."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1e6
+    except OSError:
+        pass
+    return float("inf")
+
+
 def run_episode(config_name: str, controller: str, params: dict, seed: int) -> dict:
     """Run one headless episode and return its result record."""
+    while _available_gb() < MIN_AVAILABLE_GB:  # back off instead of driving the machine into OOM
+        time.sleep(5)
     import gymnasium
     from gymnasium.wrappers.jax_to_numpy import JaxToNumpy
 

@@ -219,3 +219,117 @@ Fitted biases (z): −0.09, +0.94 and +1.13 m/s² for seeds 1, 2, 3 (mass random
   and wandered (3/3 test episodes timed out with 0 gates). Fix: the states are projected one after
   another, each onto the nearest of the 16 path points from 3 behind to 12 ahead of the previous
   state's point, so the progress stays continuous.
+
+### Closed-loop results of the long horizon and why it fails
+
+300 episodes each:
+
+| variant | success | t mean | failures |
+|---|---|---|---|
+| baseline (rerun with refactored code) | 281 (93.7 %) | 6.164 | gate 13, obstacle 3, missed 3 |
+| `long_exact_cross` (10×0.02 + 15×0.06 s, exact, crossing gates) | **32 (10.7 %)** | 7.409 | **missed 260** |
+| `long_dist05` (same + disturbance estimate) | 49 (16.3 %) | 7.237 | missed 241 |
+
+Screening on 40 seeds (rng 0) to isolate the cause:
+
+| variant | success | t mean | note |
+|---|---|---|---|
+| `tail` (baseline's 30 fine steps + 10 × 0.06 s) | 3/40 | 6.71 | adding look-ahead *on top* of the baseline breaks it |
+| `tail_now` (same without dt weighting) | 14/40 | 6.57 | |
+| `uniform50` (50 × 0.02 s, exact) | 24/40 | 6.45 | no coarse steps at all, still fails |
+| `long_now` (roadmap grid without dt weighting) | 5/40 | 7.34 | |
+
+So it is neither the coarse steps nor the integrator: **any longer horizon fails with the current
+cost.** Two mechanisms, found with `diagnose.py`:
+
+1. **Sampling variance.** The noise accumulates along a rollout, so the spread of the positions (and
+   of the tracking cost) across samples grows with time. Undiscounted, the far future dominates the
+   cost differences, and the ESS-adapted softmin selects samples by their noisy far future; the
+   near-term inputs that decide the next gate are then averaged almost at random. New parameter
+   `discount_tau`: running costs are weighted with `exp(−t/τ)`.
+2. **Model bias.** On light drones (z bias +1 m/s²) the long-horizon controller stays 0.15–0.2 m
+   above the reference and flies over low gates (seed 3: hovered above gate 2, then climbed away).
+   The short horizon compensates the bias by fast re-planning; the long one plans against a model
+   that is 0.4 m off after 1 s. With the disturbance estimate the z bias converges to +1.1 m/s²
+   (oracle 1.13) within about a second and the same episode succeeds in 6.14 s.
+
+Discount screening (40 seeds):
+
+| variant | success | t mean |
+|---|---|---|
+| `disc03` (baseline + τ = 0.3 s) | 36/40 | 6.22 |
+| `disc05` | 37/40 | 6.22 |
+| `uniform50_disc03` | 34/40 (from 24) | 6.32 |
+| `uniform50_disc05` | 31/40 | 6.36 |
+| `long_disc03` | 28/40 (from 5) | 6.77 |
+| `long_disc05` | 18/40 | 6.98 |
+| `long_dist05_disc03` | 32/40 | 6.68 |
+
+**Dependency confirmed**: the long horizon only works with the discount *and* the disturbance
+estimate. Each alone recovers part of the loss. The full matrix is benchmarked with 300 episodes
+below.
+
+### 300-episode matrix (steps 1–5 single features and their combinations)
+
+Paired against the baseline (281/300, 6.164 s). Δt is the paired mean over the episodes both
+succeed in. Noise floor: about ±2 successes per 100 seeds and ±0.005 s paired.
+
+| variant | success | t mean | Δt paired | ms/step | failures (gate/miss/obst/other) |
+|---|---|---|---|---|---|
+| baseline | 281 (93.7 %) | 6.164 | — | 13.9 | 13/3/3/0 |
+| `nominal` | 283 (94.3 %) | 6.162 | −0.004 | 11.8 | 11/4/2/0 |
+| `exact` (ZOH integrator, same grid) | **287 (95.7 %)** | 6.184 | +0.014 | 14.5 | 6/4/3/0 |
+| `crossing` (crossing-only gate check) | 226 (75.3 %) | 6.110 | −0.034 | 12.2 | 73/0/1/0 |
+| `disc03` | 282 (94.0 %) | 6.180 | +0.015 | 12.6 | 11/3/4/0 |
+| `dist02` | 286 (95.3 %) | 6.178 | +0.011 | 12.0 | 8/3/3/0 |
+| `dist05` | 281 (93.7 %) | 6.188 | +0.025 | 13.0 | 11/3/5/0 |
+| `dist10` | 283 (94.3 %) | 6.194 | +0.028 | 12.0 | 8/3/6/0 |
+| `dist05_z` (z axis only) | 285 (95.0 %) | 6.170 | +0.005 | 12.0 | 9/3/3/0 |
+| `disc03_dist05z` | **286 (95.3 %)** | 6.180 | +0.012 | 12.0 | 7/4/3/0 |
+| `sigma05` (white noise, half σ) | 267 (89.0 %) | 6.124 | −0.043 | 12.0 | 21/5/7/0 |
+| `beta06_s` (β = 0.6, σ scaled) | 263 (87.7 %) | 6.113 | −0.052 | 11.4 | 18/13/5/1 |
+| `hybrid` (tracking + progress) | 281 (93.7 %) | 6.200 | +0.017 | 19.6 | 11/0/8/0 |
+| `contouring` (progress only) | 242 (80.7 %) | 6.560 | +0.397 | 19.1 | 8/0/3/47 timeout |
+| `modes4` (4 × 256 samples) | 263 (87.7 %) | 6.296 | +0.140 | 12.4 | 23/10/4/0 |
+| `sadapt` (adaptive σ) | 267 (89.0 %) | 6.095 | −0.063 | 12.7 | 25/6/2/0 |
+| `modes4_sadapt` | 253 (84.3 %) | 6.260 | +0.094 | 12.5 | 30/8/9/0 |
+| `uniform50_disc03` (1.0 s) | 233 (77.7 %) | 6.257 | +0.093 | 22.5 | 14/49/3/1 |
+| `u50_disc03_dist05` | 250 (83.3 %) | 6.271 | +0.126 | 22.3 | 8/36/4/2 |
+| `u50_disc03_dist05z` | 245 (81.7 %) | 6.235 | +0.078 | 22.4 | 9/40/6/0 |
+| `long_dist05_disc03` (1.1 s, coarse tail) | 228 (76.0 %) | 6.602 | +0.460 | 14.4 | 4/62/6/0 |
+| `long_dist05z_disc03` | 227 (75.7 %) | 6.584 | +0.422 | 14.4 | 7/62/4/0 |
+
+Reading:
+
+- **Exact discretization helps even on the baseline grid** (+6 successes, fewer gate hits), at a
+  cost of +0.014 s. The disturbance estimate helps a little with a slow filter (α = 0.02) or on z
+  only; the x/y estimate adds noise (more obstacle hits at α ≥ 0.05). The z-only variant recovers the
+  late-reveal seeds 95 and 98 (the z offset of light drones) without losing others.
+- **Everything that shrinks the exploration loses gates**: half σ, smoothed noise with scaled σ,
+  adaptive σ (which shrinks σ once the ESS is high) and splitting the 1024 samples into 4 modes all
+  hit more gate frames but fly faster when they succeed. They make the controller more aggressive
+  and less robust. The multi-modal variant with 256 samples per mode has too few samples per mode;
+  it depends on a larger sample budget (GPU, step 6).
+- **Crossing checks alone hit the frames** (73 gate collisions): a crossing just outside the
+  opening and the states near the frame are not penalized enough with a single segment. They are
+  only useful together with the slab check ("both"), as used for coarse grids.
+- **Contouring alone is too slow and times out**; the hybrid fixes the persistent missed gate of
+  seed 37 (all 3 rngs) but loses seed 2 (late-revealed obstacle) and costs 6 ms per step.
+- **The long horizons with discount and disturbance estimate still miss gates**: 36–62 missed, most
+  at the third pass (gate 3). `diagnose.py --seed=13 --variant=u50_disc03_dist05z`: gate 3 is a
+  hairpin, the reference goes through it at 0.5 m/s and immediately loops back up over the frame
+  (0.3–0.5 m above the center, inside `gate_frame_limit`). The 1 s horizon sees the whole loop;
+  every sample that goes through the opening risks frame cost twice and the time-indexed tracking
+  cost gives no reward for actually passing, so the cheapest plan is to stay on the near side,
+  climb, and rejoin the reference after the loop. The 0.6 s horizon is already committed when the
+  loop comes into view. This is the dependency on the progress cost: the gate bonus of
+  `contouring_cost` rewards crossing the next gate (benchmarked next).
+
+### Note on the benchmark machine
+
+Stopping a benchmark with `pkill` on the parent left its 8 workers running; together with a new
+run this exhausted the 31 GB of memory and the OOM killer closed other applications. The harness now
+recycles workers every 5 episodes (a long-horizon worker grows to ~3 GB in 10 episodes, mostly
+from jit caches of the per-episode controller), workers exit when the benchmark process dies, a
+worker waits before an episode while less than 4 GB of memory are available, and at most 6 workers
+are used. Benchmarks are stopped by killing their process group.
