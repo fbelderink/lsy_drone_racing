@@ -118,3 +118,104 @@ earlier.
   need the update to use the noise relative to the truncated mean, or a smaller `sigma`.
 
 Adopted for later steps: `include_nominal` and `nan_guard`.
+
+---
+
+## Step 2 — longer horizon with variable timesteps
+
+### Changes (`attitude_mppi.py`)
+
+- `time_grid`: `horizon` steps of 1/freq followed by `n_coarse` steps of `coarse_factor`/freq. The
+  coarse steps are integer multiples of the control period, so the mid-level reference is requested
+  at the control rate for the whole horizon and sampled at the knots (`_reference`).
+- `rollout` scans over (input, step length, per-step discretization).
+- `integrator`:
+  - `euler`: forward Euler on the full state (original).
+  - `exact`: `discretize` computes the zero-order-hold matrix exponential of every attitude axis
+    (`[a, ȧ]' = [[0, 1], [k_a, k_r]] [a, ȧ] + [0, k_c] u`) and the exact thrust lag gain
+    `1 − exp(−k_t dt)` per step on the host, once. Translation uses the trapezoidal rule on the
+    accelerations at the start and the end of the step (exact for an acceleration that changes
+    linearly within the step).
+  - `rk4`: classic Runge–Kutta on the full state, as accuracy reference.
+- `shift_controls`: shift the plan by one control period on a non-uniform grid (piecewise-constant
+  inputs evaluated at the new knot times; on a uniform grid this is "drop the first, repeat the
+  last").
+- Running costs (deviation, velocity, gate slab, obstacle) are weighted per state by the length of
+  its step in control periods, so a coarse step counts as much as the fine steps it replaces.
+- `gate_mode`: `slab` (original: every state within 0.1 m of a gate plane must be near the center),
+  `crossing` (every segment between two states that crosses a gate plane is checked at the
+  intersection point, scaled by `gate_crossing_scale` = 4 ≈ number of states in the slab at
+  2.5 m/s), `both`. At 0.06 s steps and 3 m/s a state moves 0.18 m, so the 0.2 m thick slab can be
+  jumped over; the crossing check cannot.
+
+### Open-loop model accuracy (`benchmarks/mppi/model_accuracy.py`, seeds 1–3)
+
+Position error of the planning model against the env's `first_principles` sim, predicted from every
+5th state of a closed-loop baseline episode with the commands that were applied (held over a coarse
+step as the planner does). `exact+bias` adds the per-episode constant acceleration bias fitted
+from one-step residuals (an oracle for the disturbance estimate of step 3).
+
+| grid | integrator | 0.3 s | 0.6 s | 1.0 s |
+|---|---|---|---|---|
+| uniform 0.02 s | euler | 4.6 cm | 17.2 cm | 43.7 cm |
+| uniform 0.02 s | exact | 4.4 cm | 16.8 cm | 41.7 cm |
+| uniform 0.02 s | rk4 | 4.4 cm | 16.8 cm | 41.7 cm |
+| uniform 0.02 s | exact+bias | 3.0 cm | 10.6 cm | 22.9 cm |
+| uniform 0.06 s | euler | 6.6 cm | 21.8 cm | 58.6 cm |
+| uniform 0.06 s | exact | 4.8 cm | 17.9 cm | 45.0 cm |
+| uniform 0.10 s | euler | 9.5 cm | 32.0 cm | 103.7 cm |
+| uniform 0.10 s | exact | 5.5 cm | 21.5 cm | 51.0 cm |
+| uniform 0.12 s | euler | 8.0 cm | 37.5 cm | 125.6 cm |
+| uniform 0.12 s | exact | 3.6 cm | 23.3 cm | 50.3 cm |
+| 10×0.02 + 15×0.06 s | euler | 5.5 cm | 19.5 cm | 48.4 cm |
+| 10×0.02 + 15×0.06 s | exact | 5.0 cm | 18.1 cm | 41.0 cm |
+| 10×0.02 + 15×0.06 s | exact+bias | 3.4 cm | 11.9 cm | 24.4 cm |
+
+Fitted biases (z): −0.09, +0.94 and +1.13 m/s² for seeds 1, 2, 3 (mass randomization).
+
+- The exact discretization matches RK4 everywhere and is much better than Euler from 0.06 s on
+  (2× at 0.10–0.12 s). At 0.02 s all integrators are equal.
+- **The model error is dominated by a constant bias, not by the discretization.** The error grows
+  quadratically (a constant ~1 m/s² gives 0.5 · 1 · 1² = 0.5 m after 1 s). Removing the bias halves
+  the error at 0.6 s and 1.0 s.
+- **Dependency**: without the bias estimate the prediction 1 s ahead is off by 41 cm, twice the
+  gate's half opening. A long horizon then optimizes the far future against a wrong model. In a
+  single-episode check (seed 3, light drone) the 1.1 s horizon flew 0.2–0.45 m above the reference
+  and missed a gate, because the 15 coarse steps carry 45 of the 55 cost weight and the far future
+  dominates the near-term error. The short horizon hides the bias through fast feedback. So the
+  long horizon is tested alone and together with the disturbance estimate.
+
+## Step 3 — disturbance estimate
+
+### Changes (`attitude_mppi.py`)
+
+- After each command, the model predicts the next velocity (one fine step with the current
+  estimate, `_predict_vel`). At the next observation the estimate is updated with the part that is
+  not yet explained, `d += alpha · (v_obs − v_pred) / dt`, clipped to ±`dist_max` per axis. This is
+  a first-order low-pass filter of the total residual with time constant dt/alpha (0.4 s at
+  alpha = 0.05). `dist_axes` masks the estimated axes.
+- The rollouts add `d` to the acceleration (`dist_acc` in `dynamics_step`).
+- The estimate is only updated once the drone is 5 cm above its start, because the ground holds the
+  drone while the model predicts free fall, which would saturate the estimate before takeoff. It is
+  reset every episode (the mass changes).
+
+## Step 4 — progress-based cost
+
+### Changes (`attitude_mppi.py`)
+
+- `cost_mode`: `tracking` (original time-indexed position and velocity tracking), `contouring`
+  (replaces it), `hybrid` (both).
+- `contouring_cost`, evaluated on a window of the reference path from 0.5 m behind to 6 m ahead of
+  the current progress, sampled every 0.05 m (positions, unit tangents, progress, speed profile):
+  - contour: squared distance to the path over `contour_tolerance` (0.1 m), per state, weight 0.2.
+  - progress: reward of 10 per meter of progress of the last state.
+  - speed cap: squared speed above the mid-level speed profile, weight 1. The profile slows down
+    before unrevealed gates and in tight turns. As a cap instead of a target, the drone may fly
+    slower, but not faster.
+  - gate bonus: reward of 20 for crossing the next gate's plane forward within 0.12 m of its center.
+- **Shortcut bug found during development**: with an all-points nearest search over the 6 m window,
+  a rollout that left the path was credited with the progress of a later section of the track that
+  passes close by (the track crosses itself). Pure contouring then veered off before the first gate
+  and wandered (3/3 test episodes timed out with 0 gates). Fix: the states are projected one after
+  another, each onto the nearest of the 16 path points from 3 behind to 12 ahead of the previous
+  state's point, so the progress stays continuous.

@@ -120,7 +120,9 @@ def main(seeds: str | tuple = "1,2,3", every: int = 5, t_eval: tuple = (0.3, 0.6
             row = []
             for t in t_eval:
                 e = np.concatenate(errs[t]) if errs[t] else np.array([np.nan])
-                row.append(f"{100 * np.nanmean(e):7.1f}cm" if np.all(np.isfinite(e)) else "  diverged")
+                row.append(
+                    f"{100 * np.nanmean(e):7.1f}cm" if np.all(np.isfinite(e)) else "  diverged"
+                )
             print(f"{name:<18} {integrator:<8} " + " ".join(row))
 
 
