@@ -20,6 +20,7 @@ class MidLevelController:
         thrust_min=0.0,
         tilt_max=None,
         smooth_time=None,
+        gate_cap=None,
     ):
 
         self._planner = planner
@@ -50,6 +51,20 @@ class MidLevelController:
         # of this duration, which the drone needs to rotate its thrust direction (a switch from
         # full acceleration to full braking turns it by ~90 degrees).
         self.smooth_time = smooth_time
+        # Per-gate speed cap from the correction the gate can need at its reveal (None: v_gate_max for
+        # every gate). A dict with
+        #   reaction: s from the reveal until the drone starts to correct (replanning, tilting)
+        #   a_corr: m/s^2 of sideways acceleration available for the correction
+        #   slack: m the crossing point may lie off the gate center and still pass
+        #   reveal_dist: m from the gate at which its true position is revealed
+        #   pos_range: (x, y, z) m half range of the gate position randomization
+        #   yaw_range: rad half range of the gate yaw randomization
+        #   v_min: m/s lower bound of the cap
+        # Only the part of the position error across the flight direction has to be corrected (an
+        # error along it only moves the crossing), so gates approached along x or y need less than
+        # diagonal ones. The cap is the speed at which the drone covers reveal_dist in the reaction
+        # time plus the time to shift sideways by the worst-case correction d: sqrt(2 d / a_corr).
+        self.gate_cap = gate_cap
 
         self._current_reference_version = 0
         self._current_velocity_profile = None
@@ -94,6 +109,44 @@ class MidLevelController:
         self._current_progress = s0
         return ref_window  # (H + 1, 6)
 
+    def gate_correction(self, gates_quat: np.ndarray) -> np.ndarray:
+        """Correction [m] at the reveal of every gate, covering the quantile `q` of gate errors.
+
+        The path crosses the nominal gate at its center along its normal. For a true gate shifted by
+        delta and turned by dpsi, the crossing lies off the true center by
+        offset_y = (delta . n1) (n0 . y1) / (n0 . n1) - delta . y1 across, and delta_z vertically,
+        with the nominal normal n0 and the true normal n1 and lateral axis y1. The errors are
+        uniform within the randomization ranges; q = 1 is the worst case (a corner of the box).
+        """
+        c = self.gate_cap
+        q = c.get("q", 1.0)
+        x, y, z, w = np.asarray(gates_quat).T  # scalar last
+        yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y**2 + z**2))  # (G,)
+        r = np.asarray(c["pos_range"], dtype=float)
+        rng = np.random.default_rng(0)
+        n = 4000
+        corners = np.array(np.meshgrid([-1, 1], [-1, 1], [-1, 1], [-1, 1])).reshape(4, -1).T
+        u = np.vstack([rng.uniform(-1, 1, (n, 4)), corners])  # (n + 16, 4): x, y, z, yaw
+        delta = u[:, :3] * r
+        dpsi = u[:, 3:] * c["yaw_range"]  # (n', 1)
+        n0 = np.stack([np.cos(yaw), np.sin(yaw)], axis=-1)[None]  # (1, G, 2)
+        n1 = np.stack([np.cos(yaw + dpsi), np.sin(yaw + dpsi)], axis=-1)  # (n', G, 2)
+        y1 = np.stack([-np.sin(yaw + dpsi), np.cos(yaw + dpsi)], axis=-1)
+        d_n1 = np.sum(delta[:, None, :2] * n1, axis=-1)
+        d_y1 = np.sum(delta[:, None, :2] * y1, axis=-1)
+        off_y = d_n1 * np.sum(n0 * y1, axis=-1) / np.sum(n0 * n1, axis=-1) - d_y1  # (n', G)
+        need = np.hypot(
+            np.maximum(np.abs(off_y) - c["slack"], 0.0),
+            np.maximum(np.abs(delta[:, 2:3]) - c["slack"], 0.0),
+        )
+        return np.quantile(need, q, axis=0)
+
+    def gate_speed_caps(self, gates_quat: np.ndarray) -> np.ndarray:
+        """Speed cap [m/s] before the reveal of every gate, (G,)."""
+        c = self.gate_cap
+        t = c["reaction"] + np.sqrt(2 * self.gate_correction(gates_quat) / c["a_corr"])
+        return np.clip(c["reveal_dist"] / t, c["v_min"], self.v_max)
+
     def _compute_velocity_profile(self, ref: Reference, obs, eps=1e-6, pass_tol=0.2):
 
         # our path is parameterized by arc length
@@ -115,11 +168,13 @@ class MidLevelController:
         slow_down = is_pass.any(axis=0) & ~obs["gates_visited"]
         s_gate = s[is_pass.argmax(axis=0)][slow_down]  # progress of the first pass of each gate
 
+        v_cap = np.full(len(s_gate), self.v_gate_max)
+        if self.gate_cap is not None:
+            v_cap = self.gate_speed_caps(obs["gates_quat"])[np.flatnonzero(slow_down)]
         closeness = np.clip(
             (np.abs(s[:, None] - s_gate[None, :]) - self.gate_plateau) / self.gate_window, 0.0, 1.0
-        )
-        closeness = closeness.min(axis=1, initial=1.0)
-        v = np.minimum(v, self.v_gate_max + (self.v_max - self.v_gate_max) * closeness)
+        )  # (N, G')
+        v = np.minimum(v, (v_cap + (self.v_max - v_cap) * closeness).min(axis=1, initial=np.inf))
 
         ds = np.diff(s)
         if self.thrust_max is None:

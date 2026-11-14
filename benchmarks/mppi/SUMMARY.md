@@ -87,9 +87,13 @@ Other dependencies found:
 
 In order of expected value:
 
-1. **A better answer to late-revealed gates than a 2 m/s cap.** This is now the main lever: 52 % of
-   the path is flown at the cap. E.g. a cap that depends on how far the gate can still move, or on
-   the remaining distance at reveal time.
+1. **Gate speed cap (done, opt-in `gate_cap`).** `gate_reveal.py` measured how the drone copes with a
+   gate revealed at speed: at 2 m/s every correction works, at 3 m/s corrections above 0.06 m fail
+   half the time (reaction ~0.15 s). The per-gate cap from this model gives −0.09 s at 93 % success
+   (300 episodes) and halves the gate hits of a uniform cap with the same gain, but does not beat
+   the default overall. The fastest successful lap of any configuration tested is 4.5 s.
+   **Sub-4 s is not reachable by tuning caps and limits of this controller.** It needs either
+   much faster reaction to late reveals, or accepting a much lower success rate.
 2. **A jerk-limited time-optimal speed profile** instead of the moving-minimum smoothing, which
    lowers the speed over a whole window around every slow point. Expected −0.1 to −0.2 s.
 3. **Combined acceleration limit in the speed profile**: a_lat² + a_long² ≤ a_max². Today braking

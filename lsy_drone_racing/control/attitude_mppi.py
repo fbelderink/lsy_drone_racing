@@ -305,7 +305,34 @@ MLC_CONSTANTS = {
     "thrust_min": 0.0,
     "tilt_max": None,
     "smooth_time": None,  # jerk limit: ramp duration in s of every acceleration switch
+    # Per-gate cap from the worst-case correction at the reveal (None: v_gate_max for every gate).
+    # pos_range, yaw_range and reveal_dist are taken from the race config when left out. See
+    # MidLevelController.gate_speed_caps
+    "gate_cap": None,
 }
+
+
+def _gate_cap_config(gate_cap: dict | None, config: dict) -> dict | None:
+    """Fill in the gate randomization and the sensor range from the race config."""
+    if gate_cap is None:
+        return None
+    rnd = config.env.get("randomizations") or {}
+    pos = rnd.get("gate_pos", {}).get("kwargs", {})
+    rpy = rnd.get("gate_rpy", {}).get("kwargs", {})
+    pos_range = np.maximum(
+        np.abs(pos.get("minval", [0, 0, 0])), np.abs(pos.get("maxval", [0, 0, 0]))
+    )
+    yaw_range = max(abs(rpy.get("minval", [0, 0, 0])[2]), abs(rpy.get("maxval", [0, 0, 0])[2]))
+    defaults = {
+        "reaction": 0.25,
+        "a_corr": 8.0,
+        "slack": 0.08,
+        "reveal_dist": float(config.env.sensor_range),
+        "pos_range": tuple(float(x) for x in pos_range),
+        "yaw_range": float(yaw_range),
+        "v_min": 1.5,
+    }
+    return {**defaults, **dict(gate_cap)}
 
 
 def trajectory_cost(
@@ -912,6 +939,7 @@ class AttitudeMPPI(Controller):
             thrust_min=mlc["thrust_min"],
             tilt_max=mlc["tilt_max"],
             smooth_time=mlc["smooth_time"],
+            gate_cap=_gate_cap_config(mlc["gate_cap"], config),
         )
 
         # Shapes and feature switches are static for jit

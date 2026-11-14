@@ -297,6 +297,20 @@ for _w in (0.05, 0.075, 0.1):
             },
         }
 
+# Gate cap sweep on the default profile, for the gate reveal analysis (`gate_reveal.py`)
+VARIANTS["sb_lat7_vg40"] = {**SHORT_BEST, "mlc": {**LAT7, "v_gate_max": 4.0}}
+VARIANTS["sb_lat7_nocap"] = {**SHORT_BEST, "mlc": {**LAT7, "v_gate_max": 6.0}}
+
+# Per-gate cap from the worst-case correction at the reveal (reaction 0.15 s measured with
+# gate_reveal.py), against uniform caps of the same mean
+for _q in (0.9, 0.95, 0.98, 1.0):
+    VARIANTS[f"sb_gcap_q{int(round(_q * 100))}"] = {
+        **SHORT_BEST,
+        "mlc": {**LAT7, "gate_cap": {"reaction": 0.15, "q": _q}},
+    }
+VARIANTS["sb_lat7_vg225"] = {**SHORT_BEST, "mlc": {**LAT7, "v_gate_max": 2.25}}
+VARIANTS["sb_lat7_vg250"] = {**SHORT_BEST, "mlc": {**LAT7, "v_gate_max": 2.5}}
+
 
 def _on_old_defaults(v: dict) -> dict:
     return {**OLD_DEFAULTS, **v, "mlc": {**OLD_MLC, **v.get("mlc", {})}}

@@ -613,6 +613,73 @@ lap time with this controller is ~5.4–5.6 s however the turns are profiled. A 
 conservative (a proper jerk-limited time-optimal profile) could move the trade-off by perhaps
 0.1–0.2 s. Sub-4 s laps need the gate cap to go.
 
+## Gate speed cap — per-gate cap from the correction at the reveal
+
+A gate's true position is revealed within 0.7 m. Until then the drone is capped at 2 m/s (52 % of
+the path). Idea: cap each gate at the speed at which the drone can still correct for that gate's
+possible error.
+
+### Measurement (`benchmarks/mppi/gate_reveal.py`, 100 episodes, rng 0)
+
+At every reveal it logs the speed, the distance, and the correction the old path needs at the true
+gate (how far its crossing lies outside the safe opening), and whether the drone then passes that
+gate.
+
+| variant (gate cap) | speed at reveal | fail at the gate, correction 0 / < 0.03 / 0.03–0.06 / 0.06–0.1 / > 0.1 m |
+|---|---|---|
+| `default` (2.0) | 2.1 m/s | 0 / 0 / 0 / 0 / 6 % |
+| `sb_lat7_vg30` (3.0) | 2.8 m/s | 1 / 5 / 10 / 38 / 31 % |
+| `sb_lat7_vg40` (4.0) | 3.1 m/s | 3 / 6 / 8 / 56 / 38 % |
+| `sb_lat7_nocap` | 3.2 m/s | 4 / 12 / 11 / 52 / 52 % |
+
+At 2 m/s even corrections above 0.1 m work. At 3 m/s, corrections up to ~0.03 m work and above 0.06
+m half fail. This fits a reaction time of ~0.15 s plus a sideways shift at ~8 m/s². Gate 0
+(diagonal, first, fastest) gives most frame hits without a cap.
+
+### Change (`MidLevelController`, opt-in `gate_cap`)
+
+`gate_speed_caps`: cap = reveal distance / (reaction + sqrt(2 d / a_corr)), with d the correction
+that covers the quantile `q` of the gate errors (uniform within the randomization of the config).
+Only the error across the flight direction counts, so gates approached along x or y (gates 2, 3:
+caps up to 2.4–2.6 m/s) need less than diagonal ones (gates 0, 1: 2.1–2.5 m/s). Defaults: reaction
+0.15 s (measured), a_corr 8 m/s², slack 0.08 m, v_min 1.5 m/s; ranges and sensor range from the
+config.
+
+### Closed loop (100 episodes, rng 0, compared with `default`)
+
+| variant | caps (gates 0–3) | success | lap time | Δ lap (paired) |
+|---|---|---|---|---|
+| `default` | 2.0 | 95 | 5.633 s | — |
+| `sb_gcap_q100` (worst case) | 2.09 / 2.09 / 2.43 / 2.43 | 93 | 5.534 s | −0.089 s |
+| `sb_gcap_q98` | 2.26 / 2.26 / 2.49 / 2.49 | 89 | 5.487 s | −0.126 s |
+| `sb_gcap_q95` | 2.37 / 2.37 / 2.53 / 2.53 | 87 | 5.448 s | −0.160 s |
+| `sb_gcap_q90` | 2.53 / 2.53 / 2.60 / 2.60 | 83 | 5.421 s | −0.171 s |
+| `sb_lat7_vg225` (uniform) | 2.25 | 92 | 5.534 s | −0.090 s |
+| `sb_lat7_vg250` (uniform) | 2.5 | 87 | 5.457 s | −0.158 s |
+
+**On 100 episodes the per-gate cap lies on the same trade-off as a uniform cap**: same time gain for
+the same loss of successes, ~0.05 s per 2–3 % of success. The worst-case model is right (the gate it allows to be
+faster are not the ones that fail), but the time it gains is small, because a cap of 2.1–2.4 m/s
+over the 1.8 m plateau around a gate saves only a few hundredths of a second per gate.
+
+Confirmation on 300 episodes (rngs 0–2):
+
+| variant | success | lap time | Δ lap (paired) | gate / missed / obstacle |
+|---|---|---|---|---|
+| `default` | 285/300 | 5.633 s | — | 7 / 4 / 4 |
+| `sb_gcap_q100` | 279/300 | 5.537 s | −0.093 s | 7 / 6 / 8 |
+| `sb_lat7_vg225` | 271/300 | 5.522 s | −0.099 s | 15 / 7 / 7 |
+
+On 300 episodes the per-gate cap **is** better than the uniform cap at the same time gain: gate frame
+hits stay at the level of `default` (7 vs. 15), so the model of which gates can be flown faster is
+right. The remaining losses are obstacles (4 → 8), which are revealed late as well and are not part
+of the cap. Against `default` it trades −0.09 s for −2 % success; the default is unchanged, the cap
+is available as `mlc.gate_cap = {"reaction": 0.15, "q": 1.0}`. Extending the same model to obstacles
+(cap by the worst-case obstacle displacement across the path) is the obvious next step.
+
+Fastest successful laps for reference: `default` 5.04 s, `sb_lat7_vg250` 4.90 s, `sb_fast3` (a_lat
+10, cap 4, 40 % success) 4.54 s. No configuration tested so far produces a lap under 4.5 s.
+
 ### Note on the benchmark machine
 
 Stopping a benchmark with `pkill` on the parent left its 8 workers running; together with a new
