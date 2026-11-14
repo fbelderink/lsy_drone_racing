@@ -85,3 +85,50 @@ def carry_progress(old_path: ArcLengthPath, theta: float, new_reference: PathRef
     """
     old_point = np.asarray(path_lookup(old_path, jnp.float32(theta))[0])
     return new_reference.get_progress(old_point)
+
+
+def speed_profile(
+    path: ArcLengthPath, a_lat: float, a_brake: float, v_max: float, curvature_ds: float
+) -> Array:
+    """Highest speed at every path point at which the drone can follow the path's turns.
+
+    The speed is limited to v <= sqrt(a_lat / k) for the curvature k, and a backward pass limits it
+    further so that slowing down for a turn ahead never needs more deceleration than a_brake.
+
+    Args:
+        path: The path, sampled on a uniform grid.
+        a_lat: Sideways acceleration in m/s^2 allowed in turns.
+        a_brake: Deceleration in m/s^2 allowed before turns.
+        v_max: Speed limit in m/s on straight parts.
+        curvature_ds: Arc length in meters over which the curvature is measured.
+
+    Returns:
+        The speed limits in m/s with the shape (N,) of the path's grid.
+    """
+    tangents = np.asarray(path.tangents)
+    ds = float(path.length) / (len(tangents) - 1)
+    step = max(int(round(curvature_ds / ds)), 1)
+    ahead = np.minimum(np.arange(len(tangents)) + step, len(tangents) - 1)
+    curvature = la.norm(tangents[ahead] - tangents, axis=1) / (step * ds)
+    speed = np.minimum(np.sqrt(a_lat / np.maximum(curvature, 1e-6)), v_max)
+    for i in range(len(speed) - 2, -1, -1):
+        speed[i] = min(speed[i], np.sqrt(speed[i + 1] ** 2 + 2 * a_brake * ds))
+    return jnp.asarray(speed, dtype=jnp.float32)
+
+
+def profile_lookup(profile: Array, length: Array, theta: Array) -> Array:
+    """Interpolate a profile sampled on a path's grid at the given progress.
+
+    Args:
+        profile: Values on the path's uniform arc-length grid with shape (N,).
+        length: The path's length in meters.
+        theta: Progress in meters with any shape (...,). Values outside the path are clamped.
+
+    Returns:
+        The interpolated values with the shape of theta.
+    """
+    n_segments = profile.shape[0] - 1
+    grid_position = jnp.clip(theta, 0.0, length) / length * n_segments
+    i = jnp.clip(jnp.floor(grid_position).astype(jnp.int32), 0, n_segments - 1)
+    w = grid_position - i
+    return (1 - w) * profile[i] + w * profile[i + 1]
