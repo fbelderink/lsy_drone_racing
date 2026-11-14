@@ -236,6 +236,12 @@ COST_CONSTANTS = {
     "gate_crossing_scale": 4.0,  # Weight of one plane crossing relative to one state in the slab
     "contour_tolerance": 0.1,  # Tolerance in meters for the distance to the path (contouring cost)
     "gate_bonus_radius": 0.12,  # Max. offset in meters from the gate's center for the gate bonus
+    # Gate progress cost (`cost_mode` "gates")
+    "floor_height": 0.15,  # Height in meters below which the floor penalty starts
+    "reveal_dist": 0.9,  # Distance in meters to an unrevealed gate within which its speed cap holds
+    # Weight of the distance across a gate's axis relative to the distance along it in the gate
+    # progress potential: > 1 funnels the rollouts onto the axis before they reach the gate
+    "gate_funnel": 2.0,
 }
 
 COST_WEIGHTS = {
@@ -249,6 +255,11 @@ COST_WEIGHTS = {
     "progress_weight": 10.0,  # Reward per meter of progress at the end of the horizon
     "speed_cap_weight": 1.0,  # Weight for exceeding the speed profile
     "gate_bonus_weight": 20.0,  # Reward for crossing the next gate near its center
+    # Gate progress cost, used if `cost_mode` is "gates"
+    "gate_progress_weight": 10.0,  # Reward per meter of progress along the chain of next gates
+    "gate_pass_weight": 20.0,  # Reward for every gate of the chain passed near its center
+    "floor_weight": 50.0,  # Weight for flying lower than `floor_height`
+    "reveal_speed_weight": 1.0,  # Weight for exceeding the speed cap near an unrevealed gate
 }
 
 DEFAULT_PARAMS = {
@@ -280,7 +291,8 @@ DEFAULT_PARAMS = {
     # mask of the estimated axes (x, y, z); x and y add noise without a measurable bias
     "dist_axes": [0.0, 0.0, 1.0],
     # Progress-based cost (roadmap item 4)
-    "cost_mode": "tracking",  # "tracking", "contouring" or "hybrid", see `trajectory_cost`
+    "cost_mode": "tracking",  # "tracking", "contouring", "hybrid" or "gates", see `trajectory_cost`
+    "n_gate_chain": 3,  # gates ahead in the chain of the "gates" cost
     "path_window": 6.0,  # length in meters of the path window ahead of the current progress
     "path_behind": 0.5,  # length in meters of the path window behind the current progress
     "path_ds": 0.05,  # spacing in meters of the path window's points
@@ -376,7 +388,8 @@ def trajectory_cost(
             `contouring_cost`. Only used if `cost_mode` is not "tracking".
         cost_mode: "tracking": follow the time-indexed reference in position and velocity.
             "contouring": stay close to the path, make progress along it and stay below the speed
-            profile, see `contouring_cost`. "hybrid": both.
+            profile, see `contouring_cost`. "hybrid": both. "gates": no reference; make progress
+            along the chain of the next gates and pass them, see `gate_progress_cost`.
 
     Returns:
         The scalar cost.
@@ -461,8 +474,90 @@ def trajectory_cost(
         )
     if cost_mode in ("contouring", "hybrid"):
         total_cost += contouring_cost(X, path, cc, cw, w)
+    if cost_mode == "gates":
+        total_cost += gate_progress_cost(X, path, cc, cw, w)
 
     return total_cost
+
+
+def gate_progress_cost(X: Array, chain: dict, cc: dict, cw: dict, w: Array) -> Array:
+    """Reference-free cost: make progress along the chain of the next gates and pass them.
+
+    The rollout chases the gates of the chain one after the other. Its progress potential is minus
+    the remaining length of the chain: the distance to the current target gate plus the distances
+    between the following gates. The distance to the target gate weighs the part across the gate's
+    axis by `gate_funnel`, so the rollouts line up with the gate before they reach its plane;
+    with a plain distance the frame penalty makes hovering in front of the gate a local minimum. Crossing the target gate's plane forward within
+    `gate_bonus_radius` of its center makes the next gate the target, which leaves the potential
+    continuous. The racing line is not given; it follows from the progress, the gate frames and the
+    obstacles.
+
+    Terms:
+        progress: reward for the decrease of the potential from the first to the last state, in m.
+        pass: reward for every gate of the chain passed.
+        floor: squared depth below `floor_height`, weighted per state.
+        reveal speed: squared speed above a gate's cap while within `reveal_dist` of the gate, for
+            gates whose true position is not revealed yet (their cap is infinite once revealed).
+
+    Args:
+        X: State trajectory with shape (H + 1, 13).
+        chain: Dict with `gates` (K, 6) position and passing direction of the next K gates in
+            order, `valid` (K,) 1 for a gate of the chain and 0 for padding behind the last gate,
+            `v_cap` (K,) speed cap before each gate's reveal (inf once revealed).
+        cc: Cost constants.
+        cw: Cost weights.
+        w: Weight of every state with shape (H + 1,).
+
+    Returns:
+        The scalar cost.
+    """
+    pos, vel = X[:, :3], X[:, 6:9]
+    g_pos, g_dir, valid = chain["gates"][:, :3], chain["gates"][:, 3:], chain["valid"]
+    k_max = g_pos.shape[0]
+    # remaining chain length behind each gate: sum of the distances between the following gates
+    seg = jnp.linalg.norm(g_pos[1:] - g_pos[:-1], axis=-1) * valid[1:]
+    tail = jnp.concatenate((jnp.cumsum(seg[::-1])[::-1], jnp.zeros(1)))  # (K,)
+    n_valid = jnp.sum(valid).astype(jnp.int32)
+
+    def potential(p: Array, k: Array) -> Array:
+        kc = jnp.minimum(k, k_max - 1)
+        done = k >= n_valid
+        rel = p - g_pos[kc]
+        along = rel @ g_dir[kc]
+        across = jnp.linalg.norm(rel - along * g_dir[kc])
+        dist = jnp.sqrt(along**2 + (cc["gate_funnel"] * across) ** 2 + 1e-9)
+        return jnp.where(done, 0.0, -(dist + tail[kc]))
+
+    def step(k: Array, seg_pts: tuple) -> tuple:
+        p0, p1 = seg_pts
+        kc = jnp.minimum(k, k_max - 1)
+        rel0, rel1 = p0 - g_pos[kc], p1 - g_pos[kc]
+        d0, d1 = rel0 @ g_dir[kc], rel1 @ g_dir[kc]
+        forward = (d0 < 0) & (d1 >= 0)
+        frac = d0 / jnp.where(forward, d0 - d1, 1.0)
+        hit = rel0 + frac * (rel1 - rel0)
+        hit_lat = hit - (hit @ g_dir[kc]) * g_dir[kc]
+        passed = forward & (jnp.max(jnp.abs(hit_lat)) < cc["gate_bonus_radius"]) & (k < n_valid)
+        return k + passed.astype(jnp.int32), passed
+
+    k_end, passed = jax.lax.scan(step, jnp.array(0, jnp.int32), (pos[:-1], pos[1:]))
+    progress = potential(pos[-1], k_end) - potential(pos[0], jnp.array(0, jnp.int32))
+    n_passed = jnp.sum(passed)
+
+    floor = jnp.sum(w * jnp.maximum(1 - pos[:, 2] / cc["floor_height"], 0.0) ** 2)
+
+    # speed cap near unrevealed gates of the chain, by distance (the drone does not know when
+    # it will be revealed, only that it will be within the sensor range)
+    near = jnp.linalg.norm(pos[:, None, :] - g_pos[None], axis=-1) < cc["reveal_dist"]  # (H+1, K)
+    excess = jnp.maximum(jnp.linalg.norm(vel, axis=-1)[:, None] - chain["v_cap"][None], 0.0)
+    reveal_speed = jnp.sum(w[:, None] * jnp.where(near & (valid[None] > 0), excess, 0.0) ** 2)
+
+    return (
+        -cw["gate_progress_weight"] * progress
+        - cw["gate_pass_weight"] * n_passed
+        + cw["floor_weight"] * floor
+        + cw["reveal_speed_weight"] * reveal_speed
+    )
 
 
 PROJ_BEHIND = 3  # path points behind the previous state's point searched for the next state
@@ -964,6 +1059,8 @@ class AttitudeMPPI(Controller):
         self._mode = 0  # index of the executed mode
         n_window = int(round((p["path_window"] + p["path_behind"]) / p["path_ds"])) + 1
         self._path_offsets = p["path_ds"] * np.arange(n_window) - p["path_behind"]
+        self._n_chain = int(p["n_gate_chain"])
+        self._gate_caps = None  # speed cap before every gate's reveal, set at the first use
         # Disturbance estimate and the one-step prediction it is updated from
         self._dist_alpha = float(p["dist_alpha"])
         self._dist_max = float(p["dist_max"])
@@ -1025,7 +1122,7 @@ class AttitudeMPPI(Controller):
                 self._cw,
                 opts=self._opts,
                 dist_acc=jnp.asarray(self._dist),
-                path=self._path_window(obs) if self._opts.cost_mode != "tracking" else None,
+                path=self._cost_path(obs),
             )
             U_modes, sigma_modes, best, *rest = out
             return (U_modes[best], *rest, (U_modes, sigma_modes, best))
@@ -1045,13 +1142,52 @@ class AttitudeMPPI(Controller):
             self._cw,
             opts=self._opts,
             dist_acc=jnp.asarray(self._dist),
-            path=self._path_window(obs) if self._opts.cost_mode != "tracking" else None,
+            path=self._cost_path(obs),
         )
 
     def _reference(self, obs: dict[str, NDArray[np.floating]]) -> NDArray:
         """Sample the mid-level reference at the knots of the time grid, shape (H + 1, 6)."""
         ref = self._mlc.get_trajectory(obs, int(self._knot_idx[-1]), self._dt)
         return ref[self._knot_idx]
+
+    def _cost_path(self, obs: dict[str, NDArray[np.floating]]) -> dict | None:
+        """Extra input of the cost: path window, gate chain, or nothing for tracking."""
+        if self._opts.cost_mode == "tracking":
+            return None
+        if self._opts.cost_mode == "gates":
+            return self._gate_chain(obs)
+        return self._path_window(obs)
+
+    def _gate_chain(self, obs: dict[str, NDArray[np.floating]]) -> dict:
+        """The next `n_gate_chain` gates to pass, see `gate_progress_cost`."""
+        n = self._n_chain
+        seq, dirs = obs["gate_sequence"], obs["gate_sequence_direction"]
+        n_passed = int(obs["n_gates_passed"])
+        gates = np.zeros((n, 6))
+        valid = np.zeros(n)
+        v_cap = np.full(n, np.inf)
+        if self._gate_caps is None:
+            self._gate_caps = (
+                self._mlc.gate_speed_caps(obs["gates_quat"])
+                if (self._mlc.gate_cap is not None)
+                else np.full(len(obs["gates_pos"]), self._mlc.v_gate_max)
+            )
+        for j in range(n):
+            if n_passed + j >= len(seq):
+                gates[j] = gates[j - 1] if j > 0 else 0.0  # padding at the last gate
+                continue
+            i = int(seq[n_passed + j])
+            normal = R.from_quat(obs["gates_quat"][i]).apply([1.0, 0.0, 0.0])
+            gates[j] = np.concatenate((obs["gates_pos"][i], normal * dirs[n_passed + j]))
+            valid[j] = 1.0
+            if not obs["gates_visited"][i]:
+                v_cap[j] = self._gate_caps[i]
+        f32 = jnp.float32
+        return {
+            "gates": jnp.asarray(gates, dtype=f32),
+            "valid": jnp.asarray(valid, dtype=f32),
+            "v_cap": jnp.asarray(np.minimum(v_cap, 1e3), dtype=f32),
+        }
 
     def _path_window(self, obs: dict[str, NDArray[np.floating]]) -> dict:
         """Sample the reference path and its speed profile around the current progress."""
@@ -1106,7 +1242,11 @@ class AttitudeMPPI(Controller):
         Returns:
             The command [roll, pitch, yaw, thrust] as a numpy array.
         """
-        if self._mlc._current_progress >= self._mlc._planner._current_reference.length:
+        # Without a reference to track, the race ends only when every gate is passed
+        if (
+            self._opts.cost_mode != "gates"
+            and self._mlc._current_progress >= self._mlc._planner._current_reference.length
+        ):
             self._finished = True
 
         self._ref = self._reference(obs)

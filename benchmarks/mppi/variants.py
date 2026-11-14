@@ -311,6 +311,77 @@ for _q in (0.9, 0.95, 0.98, 1.0):
 VARIANTS["sb_lat7_vg225"] = {**SHORT_BEST, "mlc": {**LAT7, "v_gate_max": 2.25}}
 VARIANTS["sb_lat7_vg250"] = {**SHORT_BEST, "mlc": {**LAT7, "v_gate_max": 2.5}}
 
+# Reference-free gate progress cost (`cost_mode` "gates"): the racing line follows from progress
+# along the chain of the next gates. The horizon has to reach two gates ahead (up to ~4-5 m).
+GATES = {**SHORT_BEST, "cost_mode": "gates", "mlc": LAT7}
+VARIANTS["gates_h12"] = {**GATES, "n_coarse": 10}  # 0.6 s fine + 10 x 0.06 s = 1.2 s
+VARIANTS["gates_h18"] = {**GATES, "n_coarse": 20}  # 1.8 s
+VARIANTS["gates_h18_tau1"] = {**GATES, "n_coarse": 20, "discount_tau": 1.0}
+VARIANTS["gates_h18_tau0"] = {**GATES, "n_coarse": 20, "discount_tau": 0.0}
+VARIANTS["gates_h18_nocap"] = {
+    **GATES,
+    "n_coarse": 20,
+    "cost_weights": {"reveal_speed_weight": 0.0},
+}
+
+# MPCC racing line: progress along the spline as a loose corridor, no speed profile and no
+# reference timing; the line within the corridor and the speed are free
+MPCC = {
+    **SHORT_BEST,
+    "cost_mode": "contouring",
+    "mlc": LAT7,
+    "cost_weights": {"contour_weight": 0.05, "speed_cap_weight": 0.0},
+}
+VARIANTS["mpcc_h12"] = {**MPCC, "n_coarse": 10}
+VARIANTS["mpcc_h18"] = {**MPCC, "n_coarse": 20}
+VARIANTS["mpcc_h18_tau1"] = {**MPCC, "n_coarse": 20, "discount_tau": 1.0}
+VARIANTS["mpcc_h18_cw02"] = {
+    **MPCC,
+    "n_coarse": 20,
+    "cost_weights": {"contour_weight": 0.2, "speed_cap_weight": 0.0},
+}
+VARIANTS["gates_h18_f4"] = {**GATES, "n_coarse": 20, "cost_constants": {"gate_funnel": 4.0}}
+
+# Progress weight: with 10 per meter the drone plays safe (8-10 s laps)
+for _pw in (30, 100):
+    VARIANTS[f"gates_h12_pw{_pw}"] = {
+        **GATES,
+        "n_coarse": 10,
+        "cost_weights": {"gate_progress_weight": float(_pw)},
+    }
+    VARIANTS[f"gates_h09_pw{_pw}"] = {
+        **GATES,
+        "n_coarse": 5,
+        "cost_weights": {"gate_progress_weight": float(_pw)},
+    }
+    VARIANTS[f"mpcc_h12_cw02_pw{_pw}"] = {
+        **MPCC,
+        "n_coarse": 10,
+        "cost_weights": {
+            "contour_weight": 0.2,
+            "speed_cap_weight": 0.0,
+            "progress_weight": float(_pw),
+        },
+    }
+
+# Long reference-free horizons with a GPU sample budget (run on the GPU)
+for _n, _tag in ((16384, "16k"), (65536, "64k")):
+    VARIANTS[f"gpu_gates_h12_{_tag}"] = {**GATES, "n_coarse": 10, "n_samples": _n}
+    VARIANTS[f"gpu_gates_h18_{_tag}"] = {**GATES, "n_coarse": 20, "n_samples": _n}
+    VARIANTS[f"gpu_gates_h09_{_tag}"] = {**GATES, "n_coarse": 5, "n_samples": _n}
+
+# Gate tolerance from the real geometry (opening half 0.2 m - drone 0.086 m): the 0.07 m tolerance
+# of the frame cost makes every plan through a gate 1-2 s ahead cost more than its progress earns
+GATE_GEOM = {"gate_tolerance": 0.1, "gate_bonus_radius": 0.15}
+for _nc, _h in ((5, "09"), (10, "12"), (20, "18")):
+    VARIANTS[f"gates_h{_h}_geom"] = {**GATES, "n_coarse": _nc, "cost_constants": GATE_GEOM}
+    VARIANTS[f"gates_h{_h}_geom_pw30"] = {
+        **GATES,
+        "n_coarse": _nc,
+        "cost_constants": GATE_GEOM,
+        "cost_weights": {"gate_progress_weight": 30.0},
+    }
+
 
 def _on_old_defaults(v: dict) -> dict:
     return {**OLD_DEFAULTS, **v, "mlc": {**OLD_MLC, **v.get("mlc", {})}}

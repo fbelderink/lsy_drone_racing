@@ -680,6 +680,60 @@ is available as `mlc.gate_cap = {"reaction": 0.15, "q": 1.0}`. Extending the sam
 Fastest successful laps for reference: `default` 5.04 s, `sb_lat7_vg250` 4.90 s, `sb_fast3` (a_lat
 10, cap 4, 40 % success) 4.54 s. No configuration tested so far produces a lap under 4.5 s.
 
+## Reference-free costs — let MPPI choose the racing line
+
+Idea: instead of tracking a spline and its speed profile, reward progress through the gates and let
+the optimizer choose line and speed. The horizon must reach two gates ahead (up to ~4-5 m).
+
+### Change (`attitude_mppi.py`, `cost_mode = "gates"`)
+
+`gate_progress_cost`: the potential is minus the remaining length of the chain of the next
+`n_gate_chain` (3) gates; crossing the target gate's plane forward within `gate_bonus_radius` makes the
+next gate the target. Plus a reward per gate passed, a floor penalty and a soft speed cap within
+`reveal_dist` of unrevealed gates (the per-gate cap). The frame and obstacle costs stay. Without a
+reference the race ends only when all gates are passed. With a plain distance to the gate the drone
+hovers in front of gate 1 (the frame cost makes approaching off-axis expensive), so the distance
+across the gate axis weighs `gate_funnel` (2) times more.
+
+Also screened: MPCC (`cost_mode = "contouring"`, spline only as a corridor, no speed profile).
+
+### Results (20 seeds, rng 0; `default`: 95 %, 5.63 s)
+
+| variant | horizon | success | lap time |
+|---|---|---|---|
+| `gates_h12` | 1.2 s | 18/20 | 8.22 s |
+| `gates_h18` | 1.8 s | 5/20 | 21.6 s (timeouts) |
+| `gates_h18_tau1`, `gates_h18_f4` | 1.8 s | 0/20 | timeouts |
+| `gates_h12_pw100` (progress ×10) | 1.2 s | 14/20 | 10.5 s |
+| `gates_h09_pw30` | 0.9 s | 16/20 | 6.45 s |
+| `mpcc_h12` / `mpcc_h18` | 1.2 / 1.8 s | 6 / 4 of 20 | 8.6 / 9.6 s |
+| `mpcc_h18_cw02` (firmer corridor) | 1.8 s | 20/20 | 9.92 s |
+| `mpcc_h12_cw02_pw30/100` | 1.2 s | 0/20 | — |
+| `gpu_gates_h09_16k` | 0.9 s | 18/20 | 6.52 s |
+| `gpu_gates_h12_16k` / `_64k` | 1.2 s | 18/20 | 8.37 / 8.25 s |
+| `gpu_gates_h18_16k` / `_64k` | 1.8 s | 5/20 | 21.3 / 19.8 s |
+| `gates_h09_geom_pw30` | 0.9 s | 15/20 | 5.88 s |
+| `gates_h12_geom_pw30` | 1.2 s | 18/20 | 7.13 s |
+| `gates_h18_geom` | 1.8 s | 17/20 | 13.4 s |
+
+Diagnosis (`gates_h18`, seed 1, cost terms of the mean plan): progress over the whole horizon is worth
+4-11, while a plan through a gate 1-2 s ahead pays 110-125 of frame cost, because no sampled plan
+is within the 0.07 m gate tolerance that far ahead. The tolerance from the real geometry (0.1 m,
+`_geom`) helps (h12: 8.2 → 7.1 s, h18: timeouts → 13.4 s) but does not remove the effect.
+
+- **Longer horizons make the drone slower, not faster.** Every extra second of horizon adds the
+  expected penalty of the gates and obstacles in it, and the softmin over noisy rollouts averages
+  towards plans that avoid them. The racing line that a two-gate horizon could see is never
+  flown.
+- **It is not the sample budget**: 16k and 64k samples on the GPU give the same as 1k on the CPU.
+- **More progress weight does not help** (×3 neutral, ×10 more timeouts and crashes).
+- The best reference-free variant (0.9 s, 5.88 s, 75 %) is slower and less reliable than tracking.
+
+Conclusion: MPPI tracks a given trajectory well (centimetres) but does not find a fast line by
+itself over a long horizon. The racing line should come from a separate time-optimal planner that
+respects the limits measured above (thrust 0-1.8 g, tilt rate ~500 °/s, per-gate reveal caps), with
+MPPI tracking it.
+
 ### Note on the benchmark machine
 
 Stopping a benchmark with `pkill` on the parent left its 8 workers running; together with a new

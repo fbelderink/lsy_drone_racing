@@ -94,13 +94,20 @@ In order of expected value:
    the default overall. The fastest successful lap of any configuration tested is 4.5 s.
    **Sub-4 s is not reachable by tuning caps and limits of this controller.** It needs either
    much faster reaction to late reveals, or accepting a much lower success rate.
-2. **A jerk-limited time-optimal speed profile** instead of the moving-minimum smoothing, which
+2. **Reference-free cost (tried, opt-in `cost_mode="gates"`).** MPPI rewarded for progress through
+   the next three gates, with horizons of 0.9-1.8 s and up to 64k samples on the GPU. Longer
+   horizons make the drone slower (1.8 s: mostly timeouts), because every gate and obstacle in the
+   horizon adds expected penalty; more samples do not change this. Best: 5.88 s at 75 %.
+3. **Time-optimal racing line as the reference (next).** Plan the line and its timing offline or at
+   every reveal with an optimizer that respects thrust 0-1.8 g, tilt rate ~500 °/s and the per-gate
+   reveal caps, and let MPPI track it. This replaces both the spline and the speed profile.
+4. **A jerk-limited time-optimal speed profile** instead of the moving-minimum smoothing, which
    lowers the speed over a whole window around every slow point. Expected −0.1 to −0.2 s.
-3. **Combined acceleration limit in the speed profile**: a_lat² + a_long² ≤ a_max². Today braking
+5. **Combined acceleration limit in the speed profile**: a_lat² + a_long² ≤ a_max². Today braking
    and turning are each allowed their full limit at the same time.
-4. **A shorter path**: the 12.2 m spline path may itself be longer than needed. At 3 m/s average,
+6. **A shorter path**: the 12.2 m spline path may itself be longer than needed. At 3 m/s average,
    4 s needs a path under 12 m.
-5. **Issue #13** (JAX planners): a jitted closed loop on the GPU would make large-scale tuning of
+7. **Issue #13** (JAX planners): a jitted closed loop on the GPU would make large-scale tuning of
    the parameters above cheap (thousands of episodes per minute instead of ~3 per second).
 
 ## How to reproduce
