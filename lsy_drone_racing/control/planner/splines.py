@@ -17,6 +17,8 @@ from lsy_drone_racing.control.utils.utils import (
 class SplinePlanner:
     """Spline Planner through the gates which pushes the path away from obstacles"""
 
+    starts_at_drone = False
+
     def __init__(self, obs: ObservationDict, config: dict):
         """Args:
         obs: Initial observation.

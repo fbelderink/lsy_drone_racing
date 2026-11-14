@@ -43,6 +43,10 @@ class PathReference(Protocol):
 class PathPlanner(Protocol):
     """Plans a path through the gates and updates it when new gate or obstacle poses are sensed."""
 
+    # Whether every new path starts at the drone's current position, so a controller can restart
+    # its progress at zero instead of projecting the old progress onto the new path
+    starts_at_drone: bool
+
     def plan(self, obs: dict[str, NDArray[np.floating]]) -> PathReference:
         """Return the path to follow, re-planned if the observation revealed new poses.
 

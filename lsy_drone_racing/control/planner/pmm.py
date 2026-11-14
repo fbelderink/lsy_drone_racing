@@ -7,7 +7,10 @@ sampled trajectory to stdout. Only the trajectory's positions are used: the foll
 speed along the path itself.
 
 Every gate becomes three waypoints along its normal (before, center, after) so that the path
-crosses it roughly straight. Obstacles are ignored here; the follower has to avoid them.
+crosses it roughly straight. When the next gate lies behind a gate, an extra turnaround waypoint
+leads the path around the gate's frame instead of back through it. Where the planned path still
+comes too close to a gate or an obstacle, a waypoint pushed out of the way is inserted and the
+path is planned again (`planner/path_repair.py`).
 """
 
 from __future__ import annotations
@@ -24,6 +27,15 @@ from crazyflow.dynamics import Dynamics, load_params
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 
+from lsy_drone_racing.control.planner.path_repair import (
+    first_collision,
+    insertion_index,
+    repair_path_hit,
+    repair_waypoint,
+)
+from lsy_drone_racing.control.utils.collision import GATE_OUTER_HALF_WIDTH
+from lsy_drone_racing.control.utils.utils import drone_collision_radius, obstacle_radius
+
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
@@ -32,13 +44,19 @@ logger = logging.getLogger(__name__)
 PMM_CLI_PATH = Path(__file__).parents[3] / "tools" / "pmm_cli" / "build" / "pmm_cli"
 CLI_TIMEOUT = 1.0  # Seconds before a planner call is aborted
 
-GATE_OFFSET = 0.25  # Distance in meters of the before/after waypoints from a gate's center
-END_DISTANCE = 1.0  # Distance in meters of the path's end point behind the last gate
-END_SPEED = 2.0  # Speed in m/s at the path's end, along the last gate's normal
-ACC_FACTOR = 0.75  # Fraction of the drone's maximum thrust acceleration the planner may use
-MAX_VEL_NORM = 10.0  # Speed limit in m/s
+GATE_OFFSET = 0.3  # Distance in meters of the before/after waypoints from a gate's center
+END_DISTANCE = 0.7  # Distance in meters of the path's end point behind the last gate
+END_SPEED = 4.0  # Speed in m/s at the path's end, along the last gate's normal
+ACC_FACTOR = 1.0  # Fraction of the drone's maximum thrust acceleration the planner may use
+MAX_VEL_NORM = 11.0  # Speed limit in m/s
 SAMPLE_DT = 0.005  # Sampling period in seconds of the planned trajectory
 PATH_DS = 0.01  # Spacing in meters of the dense path points
+TURN_EXIT = 0.5  # Distance in meters of a turnaround waypoint behind the gate's plane
+# Distance in meters before the next gate's plane within which its center waypoint is dropped too:
+# a path planned from the drone through a center only a few centimeters ahead loops at its start
+CENTER_SKIP = 0.1
+TURN_CLEARANCE = 0.15  # Distance in meters between a turnaround waypoint and the drone at the frame
+MAX_REPAIRS = 12  # Maximum number of waypoints inserted to repair collisions of one plan
 
 
 def gate_normals(gates_quat: NDArray[np.floating]) -> NDArray[np.floating]:
@@ -53,6 +71,33 @@ def gate_normals(gates_quat: NDArray[np.floating]) -> NDArray[np.floating]:
     return R.from_quat(gates_quat).apply([1.0, 0.0, 0.0])
 
 
+def turnaround_waypoint(
+    center: NDArray[np.floating],
+    direction: NDArray[np.floating],
+    next_center: NDArray[np.floating],
+    side_offset: float,
+) -> NDArray[np.floating]:
+    """Waypoint behind a gate from which the path turns back around the gate's frame.
+
+    It lies TURN_EXIT behind the gate's plane, moved by side_offset to the left, to the right or up,
+    whichever points most towards the next gate. Never down, where the gate's stand is.
+
+    Args:
+        center: Gate center with shape (3,).
+        direction: Crossing direction of the gate, a unit vector with shape (3,).
+        next_center: Center of the next gate with shape (3,).
+        side_offset: Distance in meters from the gate's center to the side, beyond the frame.
+
+    Returns:
+        The waypoint with shape (3,).
+    """
+    horizontal = np.cross(direction, [0.0, 0.0, 1.0])
+    horizontal /= la.norm(horizontal)
+    sides = np.array([[0.0, 0.0, 1.0], horizontal, -horizontal])
+    side = sides[np.argmax(sides @ (next_center - center))]
+    return center + TURN_EXIT * direction + side_offset * side
+
+
 def gate_waypoints(
     pos: NDArray[np.floating],
     gates_pos: NDArray[np.floating],
@@ -60,12 +105,15 @@ def gate_waypoints(
     gate_sequence: NDArray[np.integer],
     gate_direction: NDArray[np.integer],
     n_passed: int,
+    turn_side_offset: float,
     offset: float = GATE_OFFSET,
 ) -> tuple[NDArray[np.floating], NDArray[np.floating]]:
     """Waypoints before, at and after every gate that is still to be passed.
 
     The before-waypoint of the next gate is dropped when the drone is already closer to the gate's
-    plane than it, so the path does not turn back.
+    plane than it, so the path does not turn back, and so is its center waypoint when the drone is
+    within CENTER_SKIP of the plane. When the following gate lies behind a gate's
+    plane, a turnaround waypoint is added after it, see `turnaround_waypoint`.
 
     Args:
         pos: Drone position with shape (3,).
@@ -74,6 +122,7 @@ def gate_waypoints(
         gate_sequence: 0-based gate ids in the order they are passed, with shape (n_sequence,).
         gate_direction: +1 to pass a gate along its normal, -1 against it, with shape (n_sequence,).
         n_passed: Number of gates of the sequence already passed, smaller than n_sequence.
+        turn_side_offset: Sideways distance in meters of turnaround waypoints from the center.
         offset: Distance in meters of the before/after waypoints from the gate's center.
 
     Returns:
@@ -83,12 +132,17 @@ def gate_waypoints(
     ids = gate_sequence[n_passed:]
     centers = gates_pos[ids]
     directions = gates_normal[ids] * gate_direction[n_passed:, None]
-    waypoints = np.stack(
-        (centers - offset * directions, centers, centers + offset * directions), axis=1
-    ).reshape(-1, 3)
-    if np.dot(pos - centers[0], directions[0]) > -offset:
-        waypoints = waypoints[1:]
-    return waypoints, directions[-1]
+    waypoints = []
+    for i, (center, direction) in enumerate(zip(centers, directions)):
+        waypoints += [center - offset * direction, center, center + offset * direction]
+        is_last = i + 1 == len(centers)
+        if not is_last and np.dot(centers[i + 1] - center, direction) < 0:
+            next_center = centers[i + 1]
+            waypoints.append(turnaround_waypoint(center, direction, next_center, turn_side_offset))
+    waypoints = np.array(waypoints)
+    distance_to_plane = -np.dot(pos - centers[0], directions[0])
+    n_dropped = int(distance_to_plane < offset) + int(distance_to_plane < CENTER_SKIP)
+    return waypoints[n_dropped:], directions[-1]
 
 
 def max_thrust_acceleration(drone: str) -> float:
@@ -252,10 +306,14 @@ class DensePathReference:
 
 
 class PMMPlanner:
-    """Plans a minimum-time path through the gates and re-plans when a gate's pose is revealed.
+    """Plans a minimum-time path through the gates, avoiding gate frames and obstacles.
+
+    Re-plans from the drone's current state when a gate's or an obstacle's pose is revealed.
 
     Follows the `PathPlanner` interface of `planner/interface.py`.
     """
+
+    starts_at_drone = True
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], config: dict):
         """Plan the initial path.
@@ -267,11 +325,14 @@ class PMMPlanner:
         params = load_params(Dynamics.so_rpy, config.sim.drone)
         self._gravity = float(-params["gravity_vec"][-1])
         self._max_acc_norm = ACC_FACTOR * max_thrust_acceleration(config.sim.drone)
+        self._drone_radius = drone_collision_radius(config.sim.drone)
+        self._obstacle_radius = obstacle_radius()
         self._gates_visited = np.array(obs["gates_visited"], copy=True)
+        self._obstacles_visited = np.array(obs["obstacles_visited"], copy=True)
         self._reference = self._replan(obs, version=1)
 
     def plan(self, obs: dict[str, NDArray[np.floating]]) -> DensePathReference:
-        """Return the path, re-planned from the current state if a gate's pose was revealed.
+        """Return the path, re-planned from the current state if a new pose was revealed.
 
         Args:
             obs: The current observation of the environment.
@@ -279,10 +340,13 @@ class PMMPlanner:
         Returns:
             The current path.
         """
-        revealed = np.any(obs["gates_visited"] & ~self._gates_visited)
+        revealed = np.any(obs["gates_visited"] & ~self._gates_visited) or np.any(
+            obs["obstacles_visited"] & ~self._obstacles_visited
+        )
         all_passed = int(obs["n_gates_passed"]) >= len(obs["gate_sequence"])
         if revealed and not all_passed:
             self._gates_visited = np.array(obs["gates_visited"], copy=True)
+            self._obstacles_visited = np.array(obs["obstacles_visited"], copy=True)
             self._reference = self._replan(obs, version=self._reference._version + 1)
         return self._reference
 
@@ -296,23 +360,49 @@ class PMMPlanner:
             obs["gate_sequence"],
             obs["gate_sequence_direction"],
             int(obs["n_gates_passed"]),
+            GATE_OUTER_HALF_WIDTH + self._drone_radius + TURN_CLEARANCE,
         )
-        end_pos = waypoints[-1] + END_DISTANCE * last_direction
-        cli_input = format_cli_input(
-            obs["pos"],
-            obs["vel"],
-            np.vstack((waypoints, end_pos)),
-            END_SPEED * last_direction,
-            self._gravity,
-            self._max_acc_norm,
+        waypoints = np.vstack((waypoints, waypoints[-1] + END_DISTANCE * last_direction))
+        gates = np.hstack((obs["gates_pos"], gate_normals(obs["gates_quat"])))
+        # Obstacles are not inflated by their position uncertainty: their true position is revealed
+        # 0.7 m before the drone reaches them, which triggers a replan
+        collision_args = (
+            gates,
+            obs["obstacles_pos"],
+            np.zeros(len(obs["obstacles_pos"])),
+            self._drone_radius,
+            self._obstacle_radius,
         )
-        samples = run_pmm(cli_input)
-        reference = DensePathReference(samples[:, 1:4], version=version)
+        # Waypoints that collide themselves cannot be fixed by inserting others next to them
+        waypoints = np.array([repair_waypoint(w, *collision_args) for w in waypoints])
+
+        for n_repairs in range(MAX_REPAIRS + 1):
+            cli_input = format_cli_input(
+                obs["pos"],
+                obs["vel"],
+                waypoints,
+                END_SPEED * last_direction,
+                self._gravity,
+                self._max_acc_norm,
+            )
+            samples = run_pmm(cli_input)
+            points = samples[:, 1:4]
+            hit = first_collision(points, *collision_args)
+            if hit is None or n_repairs == MAX_REPAIRS:
+                break
+            index = insertion_index(points, waypoints, hit)
+            new_waypoints = repair_path_hit(points, hit, *collision_args)
+            waypoints = np.insert(waypoints, [index] * len(new_waypoints), new_waypoints, 0)
+        if hit is not None:
+            logger.warning("PMM path v%d still collides after %d repairs", version, MAX_REPAIRS)
+
+        reference = DensePathReference(points, version=version)
         logger.debug(
-            "PMM path v%d: %.2f m, %.2f s, planned in %.1f ms",
+            "PMM path v%d: %.2f m, %.2f s, %d repairs, planned in %.1f ms",
             version,
             reference.length,
             samples[-1, 0],
+            n_repairs,
             1e3 * (time.perf_counter() - start),
         )
         return reference

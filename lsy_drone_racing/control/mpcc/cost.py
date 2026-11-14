@@ -25,14 +25,18 @@ if TYPE_CHECKING:
     from lsy_drone_racing.control.mpcc.path import ArcLengthPath
 
 MPCC_WEIGHTS = {
-    "q_nom": 25.0,  # Contour weight away from gates
-    "q_wp": 800.0,  # Additional contour weight at a gate's center, high so gates are not cut
+    # Contour weight away from gates, balanced against the progress reward mu: lower values let
+    # the drone drift off the path at speed
+    "q_nom": 150.0,
+    "q_wp": 1600.0,  # Additional contour weight at a gate's center, high so gates are not cut
     "gate_sigma": 0.3,  # Width in meters of the Gaussian around each gate
-    "q_lag": 200.0,  # Lag weight, high so that theta stays a good estimate of the closest point
+    # Lag weight, high so that theta stays a good estimate of the closest point. Must outweigh mu,
+    # or the progress runs ahead of the drone and it cuts corners
+    "q_lag": 1000.0,
     "q_rates": 0.01,  # Weight for rpy rates
     "r_du": jnp.array([1.0, 1.0, 1.0, 1.0]),  # Weights for command changes per channel
     "r_dv_theta": 0.01,  # Weight for changes of the progress speed
-    "mu": 1.0,  # Reward for progress speed
+    "mu": 40.0,  # Reward for progress speed
 }
 
 
