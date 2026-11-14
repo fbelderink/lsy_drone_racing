@@ -77,6 +77,9 @@ compilers = ">=1.9.0, <1.11.0"
 cmake = "==3.26.0"  # Pinned for motion_capture_tracking
 make = "==4.4.1"  # Pinned for motion_capture_tracking
 openblas = ">=0.3.30,<0.4"
+# Needed to build tools/pmm_cli (PMM planner)
+eigen = ">=3.4,<4"
+yaml-cpp = "*"
 
 [tool.pixi.target.win-64.dependencies]
 cmake = "==3.26.0"
@@ -91,7 +94,7 @@ lsy_drone_racing = { path = ".", editable = true }
 
 # Platform-specific acados setup.
 [tool.pixi.feature.sim.target.unix.activation]
-scripts = ["tools/setup_acados.sh"]
+scripts = ["tools/setup_acados.sh", "tools/setup_pmm.sh"]
 
 [tool.pixi.feature.sim.target.win-64.activation]
 scripts = ["tools/setup_acados.bat"]

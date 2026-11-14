@@ -27,3 +27,6 @@ ros_ws/build
 ros_ws/install
 ros_ws/log
 acados/
+
+# PMM planner CLI build
+tools/pmm_cli/build/
