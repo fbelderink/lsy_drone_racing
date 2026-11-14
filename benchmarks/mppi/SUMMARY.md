@@ -73,22 +73,27 @@ Other dependencies found:
    success:
    - A higher gate cap leads to frame hits: the true gate position is revealed too late.
    - A higher lateral limit leads to missed gates: the drone overshoots turns by 0.3–0.5 m.
-   - Neither more samples (16k on the GPU), the gate bonus nor the 1.0 s horizon fixes this, and the
-     inputs are not saturated.
+4. **Why it overshoots (investigated, `overshoot.py`, `profile_feasibility.py`):** the speed profile
+   is not flyable. It switches instantly from +10 to −10 m/s², so the thrust direction would have to
+   turn at ~1,500 °/s; the drone manages ~500 °/s. It also demands thrust outside 0–1.8 g on crests
+   and in tight turns. The planning model is accurate (1–2 cm prediction error at 0.2 s); MPPI simply
+   finds no inputs that follow the reference.
+   - Smoothing the profile (`smooth_time`) proves this: a_lat 9 goes back to 95 % success and a_lat
+     12 to 94 %.
+   - But the smoothing costs as much time as the faster limit gains. No smoothed profile beats the
+     default (all variants in the changelog), so the default is unchanged.
 
 ## Suggestions for getting faster
 
 In order of expected value:
 
-1. **Find the cause of the overshoot at a lateral limit ≥ 9**, with `diagnose.py --seed=4
-   --variant=sb_lat9_vg20`. Candidates:
-   - model error at high tilt and speed (check with `model_accuracy.py` on fast episodes);
-   - tracking-cost weights that are too soft at speed;
-   - attitude lag.
-2. **Combined acceleration limit in the speed profile**: a_lat² + a_long² ≤ a_max². Today braking
+1. **A better answer to late-revealed gates than a 2 m/s cap.** This is now the main lever: 52 % of
+   the path is flown at the cap. E.g. a cap that depends on how far the gate can still move, or on
+   the remaining distance at reveal time.
+2. **A jerk-limited time-optimal speed profile** instead of the moving-minimum smoothing, which
+   lowers the speed over a whole window around every slow point. Expected −0.1 to −0.2 s.
+3. **Combined acceleration limit in the speed profile**: a_lat² + a_long² ≤ a_max². Today braking
    and turning are each allowed their full limit at the same time.
-3. **A better answer to late-revealed gates than a 2 m/s cap**, e.g. a cap that depends on how far
-   the gate can still move, or on the remaining distance at reveal time.
 4. **A shorter path**: the 12.2 m spline path may itself be longer than needed. At 3 m/s average,
    4 s needs a path under 12 m.
 5. **Issue #13** (JAX planners): a jitted closed loop on the GPU would make large-scale tuning of

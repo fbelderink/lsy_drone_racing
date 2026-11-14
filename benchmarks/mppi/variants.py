@@ -207,6 +207,96 @@ VARIANTS: dict[str, dict] = {
     },
 }
 
+# The MPPI obstacle tube (0.2 m) is wider than the spline planner's clearance (0.141 m: drone 0.086
+# + pole 0.015 + margin 0.04), so the cost pushes the plan off reference paths that pass a pole
+# closely; at speed the drone then overshoots the next gate
+LAT9 = {**LAT8, "a_lat_max": 9.0}
+for _r in (0.12, 0.15):
+    _cc = {"obstacle_radius": _r}
+    _tag = f"r{int(_r * 100)}"
+    VARIANTS[f"sb_{_tag}"] = {
+        **SHORT_BEST,
+        "mlc": {**LAT8, "a_lat_max": 7.0},
+        "cost_constants": _cc,
+    }
+    VARIANTS[f"sb_lat8_{_tag}"] = {**SHORT_BEST, "mlc": LAT8, "cost_constants": _cc}
+    VARIANTS[f"sb_lat9_{_tag}"] = {**SHORT_BEST, "mlc": LAT9, "cost_constants": _cc}
+    VARIANTS[f"sb_lat10_{_tag}"] = {**SHORT_BEST, "mlc": LAT10, "cost_constants": _cc}
+    VARIANTS[f"sb_lat12_{_tag}"] = {
+        **SHORT_BEST,
+        "mlc": {**LAT8, "a_lat_max": 12.0},
+        "cost_constants": _cc,
+    }
+
+# At speed the turn first appears in the discounted far end of the horizon (weight exp(-t / tau))
+for _tau in (0.0, 0.6, 1.0):
+    _tag = f"tau{int(_tau * 10):02d}"
+    VARIANTS[f"sb_lat9_{_tag}"] = {**SHORT_BEST, "mlc": LAT9, "discount_tau": _tau}
+    VARIANTS[f"sb_lat10_{_tag}"] = {**SHORT_BEST, "mlc": LAT10, "discount_tau": _tau}
+
+# Thrust-feasible speed profile: |a + g| and its tilt within the drone's limits instead of a lateral
+# acceleration limit that ignores gravity (a_lat_max 20 leaves the thrust limits in charge)
+_G = 9.81
+FEAS = {
+    "16": {"thrust_max": 1.6 * _G, "thrust_min": 0.3 * _G, "tilt_max": 0.96},  # 55 deg
+    "15": {"thrust_max": 1.5 * _G, "thrust_min": 0.4 * _G, "tilt_max": 0.87},  # 50 deg
+    "17": {"thrust_max": 1.7 * _G, "thrust_min": 0.2 * _G, "tilt_max": 1.01},  # 58 deg
+}
+for _k, _f in FEAS.items():
+    VARIANTS[f"sb_feas{_k}"] = {**SHORT_BEST, "mlc": {**LAT8, "a_lat_max": 20.0, **_f}}
+    VARIANTS[f"sb_feas{_k}_a12"] = {
+        **SHORT_BEST,
+        "mlc": {**LAT8, "a_lat_max": 20.0, "a_long_max": 12.0, "a_brake_max": 12.0, **_f},
+    }
+
+# Jerk limit (`smooth_time`): a switch between accelerating and braking turns the thrust direction
+# by up to ~90 degrees, which the drone needs ~0.2-0.3 s for; the profiles above switch instantly
+LAT7 = {**LAT8, "a_lat_max": 7.0}
+for _w in (0.1, 0.15, 0.25):
+    _tag = f"s{int(round(_w * 100)):02d}"
+    VARIANTS[f"sb_lat7_{_tag}"] = {**SHORT_BEST, "mlc": {**LAT7, "smooth_time": _w}}
+    VARIANTS[f"sb_lat9_{_tag}"] = {**SHORT_BEST, "mlc": {**LAT9, "smooth_time": _w}}
+    VARIANTS[f"sb_lat12_{_tag}"] = {
+        **SHORT_BEST,
+        "mlc": {
+            **LAT8,
+            "a_lat_max": 12.0,
+            "a_long_max": 12.0,
+            "a_brake_max": 12.0,
+            "smooth_time": _w,
+        },
+    }
+    VARIANTS[f"sb_feas16_{_tag}"] = {
+        **SHORT_BEST,
+        "mlc": {**LAT8, "a_lat_max": 20.0, **FEAS["16"], "smooth_time": _w},
+    }
+    VARIANTS[f"sb_feas17_a12_{_tag}"] = {
+        **SHORT_BEST,
+        "mlc": {
+            **LAT8,
+            "a_lat_max": 20.0,
+            "a_long_max": 12.0,
+            "a_brake_max": 12.0,
+            **FEAS["17"],
+            "smooth_time": _w,
+        },
+    }
+
+# Short jerk-limit windows on fast profiles (the 0.1-0.25 s windows cost more than they gain).
+for _w in (0.05, 0.075, 0.1):
+    _tag = f"s{int(round(_w * 1000)):03d}"
+    for _a in (12, 15):
+        VARIANTS[f"sb_lat{_a}_{_tag}"] = {
+            **SHORT_BEST,
+            "mlc": {
+                **LAT8,
+                "a_lat_max": float(_a),
+                "a_long_max": float(_a),
+                "a_brake_max": float(_a),
+                "smooth_time": _w,
+            },
+        }
+
 
 def _on_old_defaults(v: dict) -> dict:
     return {**OLD_DEFAULTS, **v, "mlc": {**OLD_MLC, **v.get("mlc", {})}}

@@ -508,6 +508,111 @@ reproduces `sb_lat7_vg20` exactly (285/300, 5.633 s, paired Δ 0.000 s).
 **Result: 285/300 (95.0 %) at 5.633 s, against 281/300 (93.7 %) at 6.164 s before: −0.53 s per lap
 with 4 more successes, at the same compute (CPU 9.8 ms per step).**
 
+## Investigation — why fast profiles overshoot turns
+
+`benchmarks/mppi/overshoot.py` replays an episode and splits the error to the reference into the
+plan error (the MPPI mean plan vs. the reference window) and the prediction error (the mean plan vs.
+the positions the drone actually reaches). Seed 4, last turn into the second pass of gate 2:
+
+| variant | track error (mean) | plan error @0.2 / 0.4 / 0.6 s | prediction error @0.2 / 0.4 / 0.6 s |
+|---|---|---|---|
+| `sb_lat9_vg20` | 0.091 m | 0.12 / 0.17 / 0.31 m | 0.013 / 0.050 / 0.148 m |
+| `default` (a_lat 7) | 0.071 m | 0.09 / 0.12 / 0.20 m | 0.012 / 0.044 / 0.129 m |
+
+0.4–0.6 s before the overshoot, the plan is 0.5–0.9 m off the reference, while the prediction error
+stays at 1–2 cm at 0.2 s and ~0.1 m at 0.4 s. **The planning model is accurate. MPPI plans wide on
+purpose, because it cannot find inputs that follow the reference.**
+
+Hypotheses ruled out (seeds 4, 18 and 30 still miss the gate):
+
+- **Obstacle tube vs. planner clearance.** The planner keeps 0.141 m from a pole (drone 0.086 +
+  pole 0.015 + margin 0.04), while the MPPI tube is 0.2 m. With the tube shrunk to 0.15 m (`sb_lat9_r15`)
+  the seeds still miss.
+- **Discount.** `discount_tau` 0 / 0.6 / 1.0 (`sb_lat9_tau*`) changes nothing.
+- **Gate bonus, more samples, longer horizon.** None of them help (see above).
+
+**Cause: the reference is dynamically infeasible.** The thrust direction a quadrotor needs is
+`a + g`. Along the reference (`benchmarks/mppi/profile_feasibility.py --seed=4`, sampled at 500 Hz and
+averaged over 20 ms):
+
+| profile | lap (profile) | vertical thrust < 0.2 g | thrust > 1.8 g | tilt > 56° | thrust-axis rate p95 | time > 500 °/s |
+|---|---|---|---|---|---|---|
+| a_lat 5, 8 / 7 (old) | 6.26 s | 0 % | 0 % | 0.5 % | 756 °/s | 6.3 % |
+| a_lat 7, 10 / 10 (default) | 5.77 s | 2.6 % | 1.5 % | 7.3 % | 1516 °/s | 10.0 % |
+| a_lat 9, 10 / 10 | 5.51 s | 5.0 % | 2.9 % | 13.2 % | 1423 °/s | 11.1 % |
+| a_lat 12, 12 / 12 | 5.27 s | 8.1 % | 7.2 % | 18.8 % | 1354 °/s | 12.9 % |
+
+The drone rotates its thrust axis at most ~500 °/s in closed loop (p99 ~450–490 °/s). Two defects:
+
+1. **The lateral limit ignores gravity.** On crests and descents at speed the profile demands more
+   than 1 g downwards (thrust < 0), and in turns more than the maximum thrust of 1.8 g.
+2. **The profile switches instantly between full acceleration and full braking.** At ±10 m/s² this
+   turns the required thrust direction by ~90° in one step. In the overshooting segment, the turn
+   itself is gentle (radius ≥ 0.65 m, curvature rate small): the reference speeds up to 3.3 m/s and
+   then brakes immediately. The drone needs 0.2–0.3 s to rotate, covers most of a metre in that time,
+   and enters the turn too fast.
+
+Fixes in `MidLevelController` (both opt-in, off by default):
+
+- **Thrust-feasible profile** (`thrust_max`, `thrust_min`, `tilt_max`). At every path point, the
+  speed and the tangential acceleration are limited so that `thrust_min <= |a + g| <= thrust_max`
+  and the tilt of `a + g` is at most `tilt_max`. This replaces the lateral limit, with a
+  bisection for the speed cap and forward/backward passes with the feasible acceleration range. It
+  removes the infeasible thrust (1.6 g / 0.3 g / 55°: profile 5.54 s, no point outside the limits)
+  but not the switching. Alone it does not fix the seeds.
+- **Jerk limit** (`smooth_time`): the profile is replaced by a moving average of its moving minimum
+  over this window in time. This is never above the original profile, and every acceleration switch
+  becomes a ramp of this duration. p95 thrust-axis rate 1,500 → 250–350 °/s and time above 500 °/s
+  10 % → 1–2 %, at a cost in profile time (a_lat 7: 5.77 → 6.62 s at 0.25 s; feasible 1.6 g:
+  5.54 → 6.03 s at 0.15 s). **With `smooth_time` 0.15 s and a_lat 9, seeds 4, 18 and 30 pass all
+  gates.**
+
+### Closed loop with the fixes (100 episodes, rng 0, compared with `default`)
+
+| variant | success | lap time | Δ lap (paired) | missed gates |
+|---|---|---|---|---|
+| `default` (a_lat 7) | 95/100 | 5.633 s | — | 1 |
+| `sb_lat9_vg20` (300 ep.) | 253/300 | 5.460 s | −0.175 s | 38 |
+| `sb_lat7_s10` | 95 | 6.111 s | +0.480 s | 2 |
+| `sb_lat7_s15` | 95 | 6.421 s | +0.785 s | 2 |
+| `sb_lat9_s10` | 95 | 5.836 s | +0.206 s | 2 |
+| `sb_lat9_s15` | 95 | 6.066 s | +0.435 s | 2 |
+| `sb_lat9_s25` | **97** | 6.414 s | +0.777 s | 1 |
+| `sb_lat12_s15` | 86 | 5.771 s | +0.142 s | 12 |
+| `sb_lat12_s25` | 94 | 6.024 s | +0.397 s | 3 |
+| `sb_feas16` (no smoothing) | 72 | 5.573 s | −0.064 s | 24 |
+| `sb_feas16_s15` | 91 | 6.087 s | +0.475 s | 6 |
+| `sb_feas17_a12_s15` | 85 | 5.966 s | +0.355 s | 11 |
+
+- **The diagnosis holds.** The jerk limit removes the missed gates: a_lat 9 goes from 38 missed
+  gates in 300 episodes to 1–2 in 100, and a_lat 12 from about 65 % success to 94 %. The
+  thrust-feasible profile without smoothing does not (72 %).
+- **The moving-minimum smoothing is too conservative.** It lowers the speed over a whole window
+  around every slow point, so every smoothed variant is slower than `default`. Without smoothing the
+  drone flies 0.14 s faster than its own profile (it cuts corners and anticipates). With smoothing it
+  flies the profile exactly (`sb_lat9_s10`: profile 5.85 s, flown 5.84 s).
+
+Shorter windows on faster profiles (`sb_lat{12,15}_s{050,075,100}`, 100 episodes, rng 0):
+
+| variant | success | lap time | Δ lap (paired) | missed gates |
+|---|---|---|---|---|
+| `sb_lat12_s050` | 54 | 5.471 s | −0.218 s | 42 |
+| `sb_lat12_s075` | 66 | 5.552 s | −0.112 s | 30 |
+| `sb_lat12_s100` | 72 | 5.615 s | −0.029 s | 24 |
+| `sb_lat15_s050` | 36 | 5.368 s | −0.374 s | 59 |
+| `sb_lat15_s075` | 46 | 5.439 s | −0.269 s | 48 |
+| `sb_lat15_s100` | 50 | 5.500 s | −0.207 s | 47 |
+
+**Result: no smoothed profile beats `default`.** Every point lies on the same trade-off: a window
+long enough to remove the missed gates (≥ 0.1 s at a_lat 9, ≥ 0.25 s at a_lat 12) costs at least as
+much time as the higher limit gains. Short windows keep the time gain and lose up to 64 % of the
+episodes. The smoothing stays in the code, off by default (`smooth_time: None`).
+
+Conclusion for the lap time: with the 2 m/s cap at unrevealed gates (52 % of the path), the reachable
+lap time with this controller is ~5.4–5.6 s however the turns are profiled. A smoothing that is not
+conservative (a proper jerk-limited time-optimal profile) could move the trade-off by perhaps
+0.1–0.2 s. Sub-4 s laps need the gate cap to go.
+
 ### Note on the benchmark machine
 
 Stopping a benchmark with `pkill` on the parent left its 8 workers running; together with a new

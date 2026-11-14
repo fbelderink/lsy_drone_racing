@@ -300,6 +300,11 @@ MLC_CONSTANTS = {
     "v_gate_max": 2.0,  # speed cap within the plateau around a gate
     "gate_plateau": 0.9,  # progress in meters before and after a gate over which the cap stays flat (sensor range plus margin)
     "gate_window": 1.0,  # progress in meters before and after a gate over which the cap applies
+    # Thrust-feasible profile (None disables): limits of |a + g| in m/s^2 and of its tilt in rad
+    "thrust_max": None,
+    "thrust_min": 0.0,
+    "tilt_max": None,
+    "smooth_time": None,  # jerk limit: ramp duration in s of every acceleration switch
 }
 
 
@@ -903,6 +908,10 @@ class AttitudeMPPI(Controller):
             v_gate_max=mlc["v_gate_max"],
             gate_window=mlc["gate_window"],
             gate_plateau=mlc["gate_plateau"],
+            thrust_max=mlc["thrust_max"],
+            thrust_min=mlc["thrust_min"],
+            tilt_max=mlc["tilt_max"],
+            smooth_time=mlc["smooth_time"],
         )
 
         # Shapes and feature switches are static for jit
