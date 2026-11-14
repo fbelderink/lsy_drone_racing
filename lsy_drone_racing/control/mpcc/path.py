@@ -15,6 +15,7 @@ import numpy.linalg as la
 if TYPE_CHECKING:
     from jax import Array
 
+    from lsy_drone_racing.control.planner.interface import PathReference
     from lsy_drone_racing.control.planner.reference import Reference
 
 N_PATH_POINTS = 2048  # Grid size of the resampled path, about 1 cm spacing on a 20 m path
@@ -65,3 +66,22 @@ def path_lookup(path: ArcLengthPath, theta: Array) -> tuple[Array, Array]:
     positions = (1 - w) * path.positions[i] + w * path.positions[i + 1]
     tangents = (1 - w) * path.tangents[i] + w * path.tangents[i + 1]
     return positions, tangents / jnp.linalg.norm(tangents, axis=-1, keepdims=True)
+
+
+def carry_progress(old_path: ArcLengthPath, theta: float, new_reference: PathReference) -> float:
+    """Convert a progress on a replaced path to the progress on its replacement.
+
+    Arc lengths are not comparable between paths, e.g. a path re-planned from the drone's current
+    position starts again at zero. The point at theta on the old path is projected onto the whole
+    new path instead.
+
+    Args:
+        old_path: The path before the replan.
+        theta: Progress in meters on the old path.
+        new_reference: The re-planned path.
+
+    Returns:
+        The progress in meters on the new path.
+    """
+    old_point = np.asarray(path_lookup(old_path, jnp.float32(theta))[0])
+    return new_reference.get_progress(old_point)
