@@ -486,10 +486,10 @@ def gate_progress_cost(X: Array, chain: dict, cc: dict, cw: dict, w: Array) -> A
     The rollout chases the gates of the chain one after the other. Its progress potential is minus
     the remaining length of the chain: the distance to the current target gate plus the distances
     between the following gates. The distance to the target gate weighs the part across the gate's
-    axis by `gate_funnel`, so the rollouts line up with the gate before they reach its plane;
-    with a plain distance the frame penalty makes hovering in front of the gate a local minimum. Crossing the target gate's plane forward within
-    `gate_bonus_radius` of its center makes the next gate the target, which leaves the potential
-    continuous. The racing line is not given; it follows from the progress, the gate frames and the
+    axis by `gate_funnel`, so the rollouts line up with the gate before they reach its plane; with
+    a plain distance the frame penalty makes hovering in front of the gate a local minimum.
+    Crossing the target gate's plane forward within `gate_bonus_radius` of its center makes the
+    next gate the target, which leaves the potential continuous. The racing line is not given; it follows from the progress, the gate frames and the
     obstacles.
 
     Terms:
