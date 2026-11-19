@@ -2,7 +2,7 @@
 
 Run as:
 
-    $ python scripts/bench_mppi.py --names=baseline,beta06 --n_seeds=50
+    $ python scripts/bench_mppi.py --names=default,no_discount --n_seeds=100 --rngs=0,1,2
 
 Variants are defined in `benchmarks/mppi/variants.py` as overrides of the MPPI parameters (see
 `DEFAULT_PARAMS` in `attitude_mppi.py`). Each variant is evaluated on the seeds 1 to `n_seeds` of
@@ -11,7 +11,7 @@ the outcome (success, gate, obstacle, out of bounds, ground, timeout, missed gat
 gates passed, the lap time, and the wall time per MPPI update.
 
 Results are written to `benchmarks/mppi/results/<config stem>/<variant>.json` and a summary table
-is printed. `--compare=baseline` prints paired differences against another variant's results.
+is printed. `--compare=default` prints paired differences against another variant's results.
 """
 
 from __future__ import annotations
@@ -238,13 +238,13 @@ def paired(base: list[dict], other: list[dict]) -> str:
 
 
 def main(
-    names: str | tuple = "baseline",
+    names: str | tuple = "default",
     n_seeds: int = 50,
     seed_start: int = 1,
     config: str = "level2.toml",
     controller: str = "attitude_mppi.py",
-    workers: int = 8,
-    compare: str | None = "baseline",
+    workers: int = 6,
+    compare: str | None = None,
     rerun: bool = True,
     show: bool = False,
     rngs: str | int | tuple = 0,
