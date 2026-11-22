@@ -145,12 +145,18 @@ def gate_waypoints(
     n_dropped = int(distance_to_plane < offset) + int(distance_to_plane < CENTER_SKIP)
     waypoints = waypoints[n_dropped:]
     if n_passed > 0:
-        # Right after a gate, keep its turnaround waypoint, or the path turns back through its frame
+        # Right after a gate and still within its outline, keep its turnaround waypoint, or the path
+        # turns back through its frame. Once beside or above the frame, the drone is already around.
         passed = gate_sequence[n_passed - 1]
         passed_direction = gates_normal[passed] * gate_direction[n_passed - 1]
-        behind_passed = np.dot(pos - gates_pos[passed], passed_direction)
+        offset_from_passed = pos - gates_pos[passed]
+        behind_passed = np.dot(offset_from_passed, passed_direction)
+        in_plane_offset = offset_from_passed - behind_passed * passed_direction
+        # Gates are upright, so the in-plane offset splits into a horizontal and a vertical part
+        sideways, upwards = la.norm(in_plane_offset[:2]), abs(in_plane_offset[2])
+        within_outline = max(sideways, upwards) < GATE_OUTER_HALF_WIDTH
         next_is_behind = np.dot(centers[0] - gates_pos[passed], passed_direction) < 0
-        if next_is_behind and behind_passed < TURN_EXIT:
+        if next_is_behind and within_outline and 0.0 <= behind_passed < TURN_EXIT:
             turn = turnaround_waypoint(
                 gates_pos[passed], passed_direction, centers[0], turn_side_offset
             )
