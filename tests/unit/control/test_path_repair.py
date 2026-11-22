@@ -7,6 +7,7 @@ from lsy_drone_racing.control.planner.path_repair import (
     MIN_GATE_OFFSET,
     OBSTACLE_PUSH_MARGIN,
     first_collision,
+    insert_repair_waypoints,
     insertion_index,
     push_out_of_gate,
     push_out_of_obstacle,
@@ -166,3 +167,25 @@ def test_repair_path_hit_returns_one_waypoint_outside_the_gate_case():
     obstacles = np.array([[1.0, 0.0, 1.5]])
     hit = first_collision(points, *collision_args(obstacles))
     assert repair_path_hit(points, hit, *collision_args(obstacles)).shape == (1, 3)
+
+
+@pytest.mark.unit
+def test_insert_repair_waypoints_adds_a_single_waypoint():
+    waypoints = np.array([[0.0, 0.0, 1.0], [2.0, 0.0, 1.0]])
+    new = insert_repair_waypoints(waypoints, 1, np.array([[1.0, 0.5, 1.0]]))
+    np.testing.assert_allclose(new, [[0.0, 0.0, 1.0], [1.0, 0.5, 1.0], [2.0, 0.0, 1.0]])
+
+
+@pytest.mark.unit
+def test_insert_repair_waypoints_crossing_replaces_waypoints_on_it():
+    # Gate center and an earlier crossing of the same gate, then a waypoint far behind the gate
+    center = GATE[:3]
+    old_crossing = [center - [CROSSING_OFFSET, 0.0, 0.05], center + [CROSSING_OFFSET, 0.0, -0.05]]
+    after = center + [1.0, 0.5, 0.0]
+    waypoints = np.array([center, *old_crossing, after])
+    crossing = np.array(
+        [center - [CROSSING_OFFSET, 0.0, 0.06], center + [CROSSING_OFFSET, 0.0, -0.06]]
+    )
+    new = insert_repair_waypoints(waypoints, 3, crossing)
+    # A single crossing is left, so the path does not run back and forth through the gate
+    np.testing.assert_allclose(new, [*crossing, after])
