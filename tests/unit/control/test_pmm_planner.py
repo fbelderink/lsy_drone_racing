@@ -99,13 +99,23 @@ def test_gate_waypoints_drops_center_point_right_before_the_plane():
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(("x", "keeps_turnaround"), [(1.2, True), (1.8, False)])
-def test_gate_waypoints_keeps_turnaround_of_the_gate_just_passed(x: float, keeps_turnaround: bool):
+@pytest.mark.parametrize(
+    ("pos", "keeps_turnaround"),
+    [
+        ([1.2, 0.0, 1.0], True),  # Right behind the opening
+        ([1.8, 0.0, 1.0], False),  # Far enough behind the gate
+        ([1.2, 0.0, 1.6], False),  # Already above the frame
+        ([0.8, 0.0, 1.6], False),  # Over the frame and back on the gate's front side
+    ],
+)
+def test_gate_waypoints_keeps_turnaround_of_the_gate_just_passed(
+    pos: list[float], keeps_turnaround: bool
+):
     # Gate 1 lies behind gate 0, which the drone has just passed
     gates_pos = np.array([[1.0, 0.0, 1.0], [-1.0, 0.0, 1.0]])
     gates_normal = np.array([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]])
     waypoints, _ = gate_waypoints(
-        np.array([x, 0.0, 1.0]), gates_pos, gates_normal, SEQUENCE, FORWARD, 1, 0.5, offset=0.25
+        np.array(pos), gates_pos, gates_normal, SEQUENCE, FORWARD, 1, 0.5, offset=0.25
     )
     turnaround = turnaround_waypoint(gates_pos[0], gates_normal[0], gates_pos[1], 0.5)
     assert len(waypoints) == 3 + keeps_turnaround
