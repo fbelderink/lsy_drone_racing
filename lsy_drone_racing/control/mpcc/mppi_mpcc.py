@@ -89,6 +89,9 @@ COLLISION_WEIGHTS = {
     "obstacle_sigma": 0.1,  # Decay length in meters of the obstacle cost
     "w_crash": 3000.0,  # Cost per step from the first crash to the end of the horizon
 }
+# Clearance in meters to an obstacle below which a rollout counts as crashed. Without it the
+# optimizer plans to graze poles, and the model's prediction error then turns that into contact.
+OBSTACLE_CRASH_MARGIN = 0.02
 
 
 def crash_mask(
@@ -295,7 +298,9 @@ def mppi_mpcc_update(
     def cost_fn(X: Array, U: Array, theta: Array, v_theta: Array, dv_theta: Array) -> Array:
         radius = drone_radius + obstacle_radius
         clearance = obstacle_clearance(X[:, :3], obstacles_pos, obstacles_inflation, radius)
-        crashed = crash_mask(X[:, :3], clearance, gates, pos_limits, drone_radius)
+        crashed = crash_mask(
+            X[:, :3], clearance - OBSTACLE_CRASH_MARGIN, gates, pos_limits, drone_radius
+        )
         # A crashed rollout stays where it crashed and earns no progress from then on
         X = freeze_after_crash(X, crashed)
         clearance = obstacle_clearance(X[:, :3], obstacles_pos, obstacles_inflation, radius)
