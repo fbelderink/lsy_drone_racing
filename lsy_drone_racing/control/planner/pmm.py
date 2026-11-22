@@ -29,6 +29,7 @@ from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control.planner.path_repair import (
     first_collision,
+    insert_repair_waypoints,
     insertion_index,
     repair_path_hit,
     repair_waypoint,
@@ -392,7 +393,7 @@ class PMMPlanner:
                 break
             index = insertion_index(points, waypoints, hit)
             new_waypoints = repair_path_hit(points, hit, *collision_args)
-            waypoints = np.insert(waypoints, [index] * len(new_waypoints), new_waypoints, 0)
+            waypoints = insert_repair_waypoints(waypoints, index, new_waypoints)
         if hit is not None:
             logger.warning("PMM path v%d still collides after %d repairs", version, MAX_REPAIRS)
 

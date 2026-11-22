@@ -242,6 +242,35 @@ def insertion_index(points: NDArray[np.floating], waypoints: NDArray[np.floating
     return int(np.searchsorted(matched, hit))
 
 
+def insert_repair_waypoints(
+    waypoints: NDArray[np.floating], index: int, new_waypoints: NDArray[np.floating]
+) -> NDArray[np.floating]:
+    """Insert the waypoints of `repair_path_hit` into the waypoint list.
+
+    A straight gate crossing (two new waypoints) replaces the waypoints that lie on it, within the
+    gate's opening: the gate's center or an earlier crossing of the same gate. Inserted next to
+    them instead, repeated repairs of one gate stack crossings and the path runs back and forth.
+
+    Args:
+        waypoints: Waypoints with shape (n_waypoints, 3).
+        index: Position in `waypoints` at which the new waypoints belong, see `insertion_index`.
+        new_waypoints: Waypoints in path order with shape (n_new, 3).
+
+    Returns:
+        The new waypoint list with shape (n_waypoints', 3).
+    """
+    if len(new_waypoints) == 2:
+        start, end = new_waypoints
+        segment = end - start
+        t = (waypoints - start) @ segment / (segment @ segment)
+        closest = start + np.clip(t, 0.0, 1.0)[:, None] * segment
+        on_crossing = (t >= 0.0) & (t <= 1.0)
+        on_crossing &= la.norm(waypoints - closest, axis=1) < GATE_INNER_HALF_WIDTH
+        index = int(np.sum(~on_crossing[:index]))
+        waypoints = waypoints[~on_crossing]
+    return np.insert(waypoints, [index] * len(new_waypoints), new_waypoints, axis=0)
+
+
 def repair_waypoint(
     point: NDArray[np.floating],
     gates: NDArray[np.floating],
