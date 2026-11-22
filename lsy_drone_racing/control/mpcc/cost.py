@@ -119,7 +119,7 @@ def mpcc_cost(
     """Compute the MPCC cost of a single rollout.
 
     Args:
-        X: State trajectory with shape (H + 1, 12).
+        X: State trajectory with shape (H + 1, 13).
         U: Control sequence with shape (H, 4).
         u_prev: Previous control input with shape (4,).
         theta: Progress trajectory with shape (H + 1,).

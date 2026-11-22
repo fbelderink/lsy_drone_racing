@@ -1,9 +1,13 @@
 from types import SimpleNamespace
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from crazyflow.dynamics import Dynamics, load_params
 
+from lsy_drone_racing.control.attitude_mppi import discretize
+from lsy_drone_racing.control.mpcc.cost import MPCC_WEIGHTS
 from lsy_drone_racing.control.mpcc.mppi_mpcc import (
     COLLISION_WEIGHTS,
     MPPIMPCC,
@@ -11,6 +15,8 @@ from lsy_drone_racing.control.mpcc.mppi_mpcc import (
     collision_cost,
     crash_mask,
     freeze_after_crash,
+    mppi_mpcc_update,
+    path_speed_profile,
 )
 from lsy_drone_racing.control.mpcc.path import path_from_reference
 from lsy_drone_racing.control.planner.pmm import DensePathReference
@@ -173,3 +179,55 @@ def test_replace_path_projects_progress_otherwise():
     # The old point at x = 1.5 lies 0.5 m along the new path, the progress speed is kept
     assert mpcc._theta_pred == pytest.approx(0.5, abs=1e-3)
     assert mpcc._v_theta_pred == 0.7
+
+
+@pytest.mark.unit
+def test_mppi_mpcc_update_runs_with_rollout_model():
+    horizon, n_samples, dt = 5, 32, 0.02
+    params = load_params(Dynamics.so_rpy_rotor_drag, "cf21B_500")
+    hover_thrust = (params["mass"] * -params["gravity_vec"][-1] - params["acc_coef"]) / params[
+        "cmd_f_coef"
+    ]
+    path = path_from_reference(
+        DensePathReference(np.array([[-2.0, 0.0, 1.0], [3.0, 0.0, 1.0]]), version=1)
+    )
+    # Hovering at the start of the path, with the thrust state at hover thrust
+    x0 = jnp.zeros(13).at[:3].set(jnp.array([-2.0, 0.0, 1.0])).at[12].set(hover_thrust)
+    U_nom = jnp.tile(jnp.array([0.0, 0.0, 0.0, hover_thrust]), (horizon, 1))
+
+    out = mppi_mpcc_update(
+        key=jax.random.key(0),
+        x0=x0,
+        theta0=jnp.float32(0.0),
+        v_theta0=jnp.float32(0.0),
+        U_nom=U_nom,
+        dv_theta_nom=jnp.zeros(horizon),
+        u_prev=U_nom[0],
+        path=path,
+        speed_limit=path_speed_profile(path),
+        gates=GATES,
+        gates_revealed=jnp.array([True]),
+        obstacles_pos=jnp.array([[0.0, 2.0, 1.5]]),
+        obstacles_inflation=jnp.zeros(1),
+        pos_limits=LIMITS,
+        drone_radius=DRONE_RADIUS,
+        obstacle_radius=0.015,
+        weights=MPCC_WEIGHTS,
+        params=params,
+        dt=dt,
+        disc=discretize(params, np.full(horizon, dt)),
+        n_samples=n_samples,
+        sigma=jnp.array([0.3, 0.3, 0.0, 0.1]),
+        sigma_dv_theta=2.0,
+        target_ess=0.05,
+    )
+    U_new, dv_theta_new, theta_plan, _, _, _, _, vis_pos, _, mean_path = out
+
+    assert U_new.shape == (horizon, 4)
+    assert dv_theta_new.shape == (horizon,)
+    assert vis_pos.shape[1:] == (horizon + 1, 3)
+    assert mean_path.shape == (horizon + 1, 3)
+    assert np.all(np.isfinite(U_new)) and np.all(np.isfinite(mean_path))
+    assert np.all(np.diff(theta_plan) >= 0)
+    # Starting from hover, the drone stays close to its altitude within 0.1 s
+    np.testing.assert_allclose(mean_path[:, 2], 1.0, atol=0.05)

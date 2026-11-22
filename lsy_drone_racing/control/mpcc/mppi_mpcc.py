@@ -8,10 +8,11 @@ acceleration dv_theta next to the commands, so it chooses itself how fast to mov
 path. The progress theta of the first state is measured by projecting the drone onto the path every
 step, so replans that change the path's arc length need no extra handling.
 
-State and input conventions follow `attitude_mppi.py`:
+The rollouts use the `so_rpy_rotor_drag` model of `attitude_mppi.py`, and its state and input
+conventions:
 
-    x = [pos(3), rpy(3), vel(3), drpy(3)]
-    u = [roll, pitch, yaw, thrust]  (thrust is the total collective thrust in N)
+    x = [pos(3), rpy(3), vel(3), drpy(3), thrust(1)]  (thrust is the lagged collective thrust in N)
+    u = [roll, pitch, yaw, thrust]  (thrust is the commanded total collective thrust in N)
 """
 
 from __future__ import annotations
@@ -26,7 +27,12 @@ from crazyflow.dynamics.utils.rotation import ang_vel2rpy_rates
 from crazyflow.sim.visualize import draw_line, draw_points
 from scipy.spatial.transform import Rotation as R
 
-from lsy_drone_racing.control.attitude_mppi import adaptive_lambda, rollout, speed_to_rgba
+from lsy_drone_racing.control.attitude_mppi import (
+    adaptive_lambda,
+    discretize,
+    rollout,
+    speed_to_rgba,
+)
 from lsy_drone_racing.control.mpcc.cost import MPCC_WEIGHTS, mpcc_cost, progress_step
 from lsy_drone_racing.control.mpcc.path import (
     carry_progress,
@@ -69,6 +75,9 @@ PROGRESS_WINDOW = (0.2, 0.2)  # (behind, ahead) in meters around the predicted p
 # The progress speed is a state that only changes by DV_THETA_MAX, so without this bound it can run
 # ahead of the drone and leave every sampled rollout with a reference far ahead of it.
 V_THETA_SLACK = 1.0
+# Integrator of the rollouts, see `attitude_mppi.dynamics_step`: exact discretization of the
+# attitude and thrust dynamics, which is stable for any step length
+INTEGRATOR = "exact"
 
 # Obstacle and crash cost, after Williams et al., "Model Predictive Path Integral Control using
 # Covariance Variable Importance Sampling", 2015: w_obs * exp(-d^2 / (2 sigma^2)) on the clearance d
@@ -111,11 +120,11 @@ def freeze_after_crash(X: Array, crashed: Array) -> Array:
     """Hold the state of the first crashed step for the rest of the rollout.
 
     Args:
-        X: State trajectory with shape (H + 1, 12).
+        X: State trajectory with shape (H + 1, 13).
         crashed: Crash flags with shape (H + 1,), see `crash_mask`.
 
     Returns:
-        The state trajectory with shape (H + 1, 12).
+        The state trajectory with shape (H + 1, 13).
     """
     first_crash = jnp.argmax(crashed)
     return jnp.where(crashed[:, None], X[first_crash], X)
@@ -208,6 +217,7 @@ def mppi_mpcc_update(
     weights: dict,
     params: dict,
     dt: float,
+    disc: dict,
     n_samples: int,
     sigma: Array,
     sigma_dv_theta: float,
@@ -221,7 +231,7 @@ def mppi_mpcc_update(
 
     Args:
         key: JAX PRNG key.
-        x0: Current state with shape (12,).
+        x0: Current state with shape (13,).
         theta0: Current progress in meters.
         v_theta0: Current progress speed in m/s.
         U_nom: Nominal command sequence with shape (H, 4).
@@ -238,8 +248,9 @@ def mppi_mpcc_update(
         drone_radius: Collision radius of the drone in meters.
         obstacle_radius: Collision radius of the obstacle poles in meters.
         weights: MPCC cost weights, see `MPCC_WEIGHTS`.
-        params: Drone parameters.
+        params: Drone parameters of the `so_rpy_rotor_drag` model.
         dt: Integration step in seconds.
+        disc: Discretization of the H steps of length dt, see `attitude_mppi.discretize`.
         n_samples: Number of sampled sequences.
         sigma: Per-channel standard deviation of the command noise with shape (4,).
         sigma_dv_theta: Standard deviation of the progress acceleration noise.
@@ -271,7 +282,12 @@ def mppi_mpcc_update(
     )
     sampled_dv_theta = jnp.clip(sampled_dv_theta, -DV_THETA_MAX, DV_THETA_MAX)
 
-    rollouts = jax.vmap(rollout, in_axes=(None, 0, None, None))(x0, sampled_actions, params, dt)
+    dts = jnp.full(horizon, dt)
+
+    def simulate(U: Array) -> Array:
+        return rollout(x0, U, params, dts, disc, INTEGRATOR)
+
+    rollouts = jax.vmap(simulate)(sampled_actions)
     theta, v_theta, dv_theta = jax.vmap(
         progress_rollout, in_axes=(None, None, 0, None, None, None, None, None)
     )(theta0, v_theta0, sampled_dv_theta, path, speed_limit, gates, gates_revealed, dt)
@@ -304,7 +320,7 @@ def mppi_mpcc_update(
     best = jax.lax.top_k(-costs, N_VIS_BEST)[1]
     strided = jnp.arange(N_VIS_RANDOM) * (n_samples // N_VIS_RANDOM)
     vis_idx = jnp.concatenate((best, strided))
-    mean_path = rollout(x0, U_new, params, dt)[:, :3]
+    mean_path = simulate(U_new)[:, :3]
 
     return (
         U_new,
@@ -346,7 +362,11 @@ class MPPIMPCC:
         self._sigma = jnp.array([0.15, 0.15, 0.0, 0.05]) * 2.0
         self._sigma_dv_theta = 2.0  # noise std of the progress acceleration in m/s^2
         self._target_ess = 0.05  # fraction of samples that should effectively contribute
-        self._params = load_params(Dynamics.so_rpy, config.sim.drone)
+        self._params = load_params(Dynamics.so_rpy_rotor_drag, config.sim.drone)
+        self._disc = discretize(self._params, np.full(self._horizon, self._dt))
+        # The thrust is not observed, so it is estimated by passing the commands through the lag.
+        # The drone starts on the ground with the motors off.
+        self._thrust = 0.0
         # Hover command, inverted from force = acc_coef + cmd_f_coef * cmd
         self._hover_thrust = float(
             (self._params["mass"] * -self._params["gravity_vec"][-1] - self._params["acc_coef"])
@@ -380,11 +400,13 @@ class MPPIMPCC:
         self._run_update(self._key, obs, self._theta_pred)
 
     def _state(self, obs: dict[str, NDArray[np.floating]]) -> Array:
-        """Convert an observation to the planning state [pos, rpy, vel, drpy]."""
+        """Convert an observation to the planning state [pos, rpy, vel, drpy, thrust]."""
         rpy = R.from_quat(obs["quat"]).as_euler("xyz")
         # The model uses roll/pitch/yaw rates, the observation gives the body angular velocity
         drpy = ang_vel2rpy_rates(obs["quat"], obs["ang_vel"])
-        return jnp.asarray(np.concatenate((obs["pos"], rpy, obs["vel"], drpy)))
+        return jnp.asarray(
+            np.concatenate((obs["pos"], rpy, obs["vel"], drpy, [self._thrust])), dtype=jnp.float32
+        )
 
     def _run_update(self, key: Array, obs: dict[str, NDArray[np.floating]], theta0: float) -> tuple:
         """Run one MPPI iteration from the current observation."""
@@ -413,6 +435,7 @@ class MPPIMPCC:
             MPCC_WEIGHTS,
             self._params,
             self._dt,
+            self._disc,
             self._n_samples,
             self._sigma,
             self._sigma_dv_theta,
@@ -484,7 +507,10 @@ class MPPIMPCC:
         self._U_nom = jnp.concatenate((U_new[1:], U_new[-1:]))
         self._dv_theta_nom = jnp.concatenate((dv_theta_new[1:], dv_theta_new[-1:]))
         # Only the first input is applied, the rest is re-planned at the next step
-        return np.asarray(U_new[0], dtype=np.float32)
+        action = np.asarray(U_new[0], dtype=np.float32)
+        # Propagate the thrust estimate with the model's first-order lag over one step
+        self._thrust += float(self._disc["thrust_gain"][0]) * (float(action[3]) - self._thrust)
+        return action
 
     def is_finished(self, obs: dict[str, NDArray[np.floating]]) -> bool:
         """Check whether the path's end is reached or all gates are passed.
