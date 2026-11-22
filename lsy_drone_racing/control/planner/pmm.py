@@ -143,7 +143,19 @@ def gate_waypoints(
     waypoints = np.array(waypoints)
     distance_to_plane = -np.dot(pos - centers[0], directions[0])
     n_dropped = int(distance_to_plane < offset) + int(distance_to_plane < CENTER_SKIP)
-    return waypoints[n_dropped:], directions[-1]
+    waypoints = waypoints[n_dropped:]
+    if n_passed > 0:
+        # Right after a gate, keep its turnaround waypoint, or the path turns back through its frame
+        passed = gate_sequence[n_passed - 1]
+        passed_direction = gates_normal[passed] * gate_direction[n_passed - 1]
+        behind_passed = np.dot(pos - gates_pos[passed], passed_direction)
+        next_is_behind = np.dot(centers[0] - gates_pos[passed], passed_direction) < 0
+        if next_is_behind and behind_passed < TURN_EXIT:
+            turn = turnaround_waypoint(
+                gates_pos[passed], passed_direction, centers[0], turn_side_offset
+            )
+            waypoints = np.vstack((turn, waypoints))
+    return waypoints, directions[-1]
 
 
 def max_thrust_acceleration(drone: str) -> float:
