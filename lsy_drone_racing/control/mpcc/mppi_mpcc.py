@@ -225,6 +225,7 @@ def mppi_mpcc_update(
     obstacles_inflation: Array,
     pos_limits: Array,
     drone_radius: Array,
+    gate_margin: Array,
     obstacle_radius: Array,
     cost_fn: CostFunction,
     cost_inputs: dict,
@@ -260,6 +261,7 @@ def mppi_mpcc_update(
             `obstacle_clearance`.
         pos_limits: Lower and upper position limits with shape (2, 3).
         drone_radius: Collision radius of the drone in meters.
+        gate_margin: Extra radius in meters of the drone in the gate contact check.
         obstacle_radius: Collision radius of the obstacle poles in meters.
         cost_fn: Path-following cost of one rollout, see `CostFunction`.
         cost_inputs: Weights and arrays passed on to cost_fn.
@@ -312,7 +314,11 @@ def mppi_mpcc_update(
         radius = drone_radius + obstacle_radius
         clearance = obstacle_clearance(X[:, :3], obstacles_pos, obstacles_inflation, radius)
         crashed = crash_mask(
-            X[:, :3], clearance - OBSTACLE_CRASH_MARGIN, gates, pos_limits, drone_radius
+            X[:, :3],
+            clearance - OBSTACLE_CRASH_MARGIN,
+            gates,
+            pos_limits,
+            drone_radius + gate_margin,
         )
         # A crashed rollout stays where it crashed and earns no progress from then on
         X = freeze_after_crash(X, crashed)
@@ -476,6 +482,8 @@ class MPPIMPCC:
         config: dict,
         planner: PathPlanner,
         objective: MPCCObjective | None = None,
+        carry_window: tuple[float, float] | None = None,
+        gate_margin: float = 0.0,
     ):
         """Initialize the optimizer and compile the update.
 
@@ -484,6 +492,13 @@ class MPPIMPCC:
             config: The race configuration.
             planner: Planner of the path to follow.
             objective: Cost and progress limits to optimize, `ContouringObjective` if None.
+            carry_window: (behind, ahead) window in meters around the old progress in which the
+                progress is searched on a re-planned path that does not start at the drone. None
+                searches the whole path, which can jump to another section where the track
+                crosses itself.
+            gate_margin: Extra radius in meters of the drone in the rollouts' gate contact check.
+                The check uses the drone's collision sphere, while the simulator collides the
+                drone's box, whose corners reach further.
         """
         self._dt = 1 / config.env.freq
         self._horizon = 25  # planning steps, 0.5 s at 50 Hz
@@ -506,6 +521,8 @@ class MPPIMPCC:
         limits = config.env.track.safety_limits
         self._pos_limits = jnp.array([limits.pos_limit_low, limits.pos_limit_high])
         self._drone_radius = jnp.float32(drone_collision_radius(config.sim.drone))
+        self._gate_margin = jnp.float32(gate_margin)
+        self._carry_window = carry_window
         self._obstacle_radius = jnp.float32(obstacle_radius())
         self._obstacle_uncertainty = obstacle_position_uncertainty(config)
 
@@ -562,6 +579,7 @@ class MPPIMPCC:
             ),
             self._pos_limits,
             self._drone_radius,
+            self._gate_margin,
             self._obstacle_radius,
             self._objective.cost_fn,
             self._objective.cost_inputs(obs),
@@ -588,7 +606,9 @@ class MPPIMPCC:
             v_theta_max = self._objective.limits.v_max
             self._v_theta_pred = float(np.clip(speed_along_path, 0.0, v_theta_max))
         else:
-            self._theta_pred = carry_progress(self._path, self._theta_pred, self._reference)
+            self._theta_pred = carry_progress(
+                self._path, self._theta_pred, self._reference, self._carry_window
+            )
         self._path = new_path
         self._objective.on_new_path(new_path)
         self._path_version = self._reference._version

@@ -163,6 +163,7 @@ def controller_after_replan(starts_at_drone: bool, vel: list[float]) -> MPPIMPCC
     mpcc = MPPIMPCC.__new__(MPPIMPCC)
     mpcc._planner = SimpleNamespace(starts_at_drone=starts_at_drone)
     mpcc._objective = ContouringObjective()
+    mpcc._carry_window = None
     mpcc._path = path_from_reference(old)
     mpcc._theta_pred = 1.5
     mpcc._v_theta_pred = 0.7
@@ -200,7 +201,10 @@ def contouring_objective(path: ArcLengthPath) -> ContouringObjective:
 def corridor_objective(path: ArcLengthPath) -> CorridorObjective:
     """MPCC++ objective on the given path, with a gate crossing 2 m along it."""
     planner = SimpleNamespace(gate_progress=np.array([2.0]))
-    objective = CorridorObjective(SimpleNamespace(sim=SimpleNamespace(drone="cf21B_500")), planner)
+    config = SimpleNamespace(
+        sim=SimpleNamespace(drone="cf21B_500"), env=SimpleNamespace(sensor_range=0.7)
+    )
+    objective = CorridorObjective(config, planner)
     objective.on_new_path(path)
     return objective
 
@@ -237,9 +241,12 @@ def test_mppi_mpcc_update_runs_with_rollout_model(make_objective: Callable):
         obstacles_inflation=jnp.zeros(1),
         pos_limits=LIMITS,
         drone_radius=DRONE_RADIUS,
+        gate_margin=0.0,
         obstacle_radius=0.015,
         cost_fn=objective.cost_fn,
-        cost_inputs=objective.cost_inputs({"gates_pos": np.asarray(GATES[:, :3])}),
+        cost_inputs=objective.cost_inputs(
+            {"gates_pos": np.asarray(GATES[:, :3]), "gates_visited": np.array([True])}
+        ),
         limits=objective.limits,
         params=params,
         dt=dt,

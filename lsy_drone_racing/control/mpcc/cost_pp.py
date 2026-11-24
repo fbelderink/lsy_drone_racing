@@ -3,8 +3,10 @@
 Compared to the MPCC cost of `mpcc/cost.py`, the contour weight is constant and low, and safety at
 the gates comes from a soft tunnel constraint instead (see `mpcc/corridor.py`). The contour error
 is split into its horizontal and vertical components along the tunnel's axes. The progress speed
-has no hard limits: the quadratic cost R_v * v^2 against the reward mu * v makes mu / (2 R_v) the
-preferred progress speed.
+has no hard upper limit: the quadratic cost R_v * v^2 against the reward mu * v makes mu / (2 R_v)
+the preferred progress speed. R_v rises where the path approaches a gate whose true pose is not
+revealed yet, so the drone slows down until it sees the gate, similar to how the contour weight of
+`mpcc/cost.py` rises at the gates.
 
 The inputs follow the conventions of `mpcc/cost.py`: command differences replace the single rotor
 thrust differences, and rpy rates replace the body rates.
@@ -14,6 +16,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from crazyflow.sim.visualize import draw_line
@@ -48,6 +51,11 @@ MPCC_PP_WEIGHTS = {
     "q_rates_yaw": 0.01,  # Weight for the yaw rate
     "r_du": jnp.array([1.0, 1.0, 1.0, 1.0]),  # Weights for command changes per channel
     "r_v_theta": 2.0,  # Weight for the squared progress speed
+    # Additional weight for the squared progress speed near an unrevealed gate. With mu = 40 and
+    # r_v_theta = 2, the preferred progress speed there is 40 / (2 * (2 + 8)) = 2 m/s
+    "r_v_theta_unrevealed": 8.0,
+    # Distance in meters over which the additional weight fades in at `slow_radius` from the gate
+    "slow_sigma": 0.1,
     "mu": 40.0,  # Reward for progress speed
     "w_tunnel": 1000.0,  # Weight of the tunnel barrier
     "alpha": 100.0,  # Slope of the tunnel barrier in 1/m
@@ -61,9 +69,37 @@ TUNNEL_W_NOMINAL = 1.0  # Half-width in meters away from gates
 TUNNEL_D_MID = 0.35
 TUNNEL_STEEPNESS = 0.05
 
+# How far in meters beyond the sensor range around an unrevealed gate the drone already slows down
+SLOW_MARGIN = 0.3
+
 # Path points between drawn tunnel cross-sections. Every drawn segment uses one of the viewer's 1000
 # geoms, and the rollouts already use most of them.
 RENDER_STRIDE = 64
+
+
+def progress_speed_weight(
+    path_pos: Array, gates_pos: Array, gates_revealed: Array, slow_radius: float, weights: dict
+) -> Array:
+    """Weight of the squared progress speed, which rises near gates whose pose is not revealed.
+
+    The weight depends on the path position, not on the drone position. It rises along a sigmoid of
+    the horizontal distance to every unrevealed gate, which is halfway up at slow_radius, the same
+    horizontal distance at which the sensors reveal the poses.
+
+    Args:
+        path_pos: Path positions with shape (..., 3).
+        gates_pos: Gate positions with shape (n_gates, 3).
+        gates_revealed: Whether each gate's true pose is known, with shape (n_gates,).
+        slow_radius: Horizontal distance in meters from a gate at which the slowdown is halfway.
+        weights: Cost weights, see `MPCC_PP_WEIGHTS`.
+
+    Returns:
+        The weights with shape (...,).
+    """
+    distance = jnp.linalg.norm(path_pos[..., None, :2] - gates_pos[:, :2], axis=-1)
+    near = jax.nn.sigmoid((slow_radius - distance) / weights["slow_sigma"])
+    n_near_unrevealed = jnp.sum(near * ~gates_revealed, axis=-1)
+    return weights["r_v_theta"] + weights["r_v_theta_unrevealed"] * n_near_unrevealed
 
 
 def mpcc_pp_cost(
@@ -86,8 +122,9 @@ def mpcc_pp_cost(
         v_theta: Progress speed trajectory with shape (H + 1,).
         dv_theta: Progress acceleration sequence with shape (H,). Not penalised.
         path: The path to follow.
-        cost_inputs: "weights" (see `MPCC_PP_WEIGHTS`) and "half_width", the tunnel's half-width on
-            the path's grid with shape (N,).
+        cost_inputs: "weights" (see `MPCC_PP_WEIGHTS`), "half_width", the tunnel's half-width on
+            the path's grid with shape (N,), and for the slowdown near unrevealed gates (see
+            `progress_speed_weight`) "gates_pos", "gates_revealed" and "slow_radius".
 
     Returns:
         The scalar cost.
@@ -108,7 +145,14 @@ def mpcc_pp_cost(
     yaw_rate_cost = weights["q_rates_yaw"] * jnp.sum(X[:, 11] ** 2)
     command_change = jnp.diff(jnp.vstack((u_prev, U)), axis=0)
     command_cost = jnp.sum(weights["r_du"] * command_change**2)
-    progress_cost = jnp.sum(weights["r_v_theta"] * v_theta**2 - weights["mu"] * v_theta)
+    r_v_theta = progress_speed_weight(
+        path_pos,
+        cost_inputs["gates_pos"],
+        cost_inputs["gates_revealed"],
+        cost_inputs["slow_radius"],
+        weights,
+    )
+    progress_cost = jnp.sum(r_v_theta * v_theta**2 - weights["mu"] * v_theta)
     tunnel_cost = weights["w_tunnel"] * jnp.sum(
         tunnel_barrier(e_n, e_b, half_width, weights["alpha"])
     )
@@ -131,8 +175,10 @@ class CorridorObjective:
     The tunnel narrows at the gate crossings of `CenterlinePlanner`'s current centerline.
     """
 
-    # No hard limits on the progress except that it never reverses
-    limits = ProgressLimits(v_max=jnp.inf, dv_max=jnp.inf, v_slow=jnp.inf, slack=jnp.inf)
+    # The progress never reverses, and may start a step at most 1 m/s faster than the drone moves
+    # along the path. Without that bound, the progress can run past a gate's narrow section while
+    # the drone is still before the gate, and the drone then flies around the gate.
+    limits = ProgressLimits(v_max=jnp.inf, dv_max=jnp.inf, v_slow=jnp.inf, slack=1.0)
 
     def __init__(self, config: dict, planner: CenterlinePlanner):
         """Initialize the objective.
@@ -145,6 +191,7 @@ class CorridorObjective:
         self._w_gate = (
             GATE_INNER_HALF_WIDTH - drone_collision_radius(config.sim.drone) - TUNNEL_MARGIN
         )
+        self._slow_radius = config.env.sensor_range + SLOW_MARGIN
         self._path = None
         self._half_width = None
         self.speed_limit = None
@@ -166,8 +213,14 @@ class CorridorObjective:
         self.speed_limit = jnp.full(path.positions.shape[0], jnp.finfo(jnp.float32).max)
 
     def cost_inputs(self, obs: dict[str, NDArray[np.floating]]) -> dict:
-        """The weights and the tunnel's half-width."""
-        return {"weights": MPCC_PP_WEIGHTS, "half_width": self._half_width}
+        """The weights, the tunnel's half-width and the gates for the slowdown."""
+        return {
+            "weights": MPCC_PP_WEIGHTS,
+            "half_width": self._half_width,
+            "gates_pos": jnp.asarray(obs["gates_pos"]),
+            "gates_revealed": jnp.asarray(obs["gates_visited"]),
+            "slow_radius": self._slow_radius,
+        }
 
     def render(self, sim: Sim):
         """Draw the tunnel's four edges."""

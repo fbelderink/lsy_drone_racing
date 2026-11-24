@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -10,9 +12,18 @@ from lsy_drone_racing.control.mpcc.corridor import (
     tunnel_frame,
     tunnel_half_width_profile,
 )
-from lsy_drone_racing.control.mpcc.cost_pp import MPCC_PP_WEIGHTS, mpcc_pp_cost
+from lsy_drone_racing.control.mpcc.cost_pp import (
+    MPCC_PP_WEIGHTS,
+    mpcc_pp_cost,
+    progress_speed_weight,
+)
 from lsy_drone_racing.control.mpcc.path import ArcLengthPath
 from lsy_drone_racing.control.planner.centerline import CenterlinePlanner
+from lsy_drone_racing.control.utils.utils import drone_collision_radius, obstacle_radius
+
+CONFIG = SimpleNamespace(sim=SimpleNamespace(drone="cf21B_500"))
+POLE_CLEARANCE = drone_collision_radius("cf21B_500") + obstacle_radius()
+FAR_POLE = [10.0, 10.0, 1.55]
 
 
 def straight_path(length: float = 10.0, n_points: int = 1001) -> ArcLengthPath:
@@ -24,8 +35,13 @@ def straight_path(length: float = 10.0, n_points: int = 1001) -> ArcLengthPath:
     return ArcLengthPath(jnp.asarray(length), jnp.asarray(positions), jnp.asarray(tangents))
 
 
-def track_obs(gate_1_pos: list[float] | None = None, visited: list[bool] | None = None) -> dict:
-    """Two gates: one facing +x, one facing +y passed backwards (towards -y)."""
+def track_obs(
+    gate_1_pos: list[float] | None = None,
+    visited: list[bool] | None = None,
+    pole_pos: list[float] | None = None,
+    pole_visited: bool = False,
+) -> dict:
+    """Two gates: one facing +x, one facing +y passed backwards (towards -y), and one pole."""
     gates_pos = np.array([[1.0, 0.0, 1.0], gate_1_pos or [3.0, 2.0, 1.2]])
     gates_quat = R.from_euler("z", [[0.0], [np.pi / 2]]).as_quat()
     return {
@@ -35,12 +51,21 @@ def track_obs(gate_1_pos: list[float] | None = None, visited: list[bool] | None 
         "gates_visited": np.array(visited or [False, False]),
         "gate_sequence": np.array([0, 1]),
         "gate_sequence_direction": np.array([1, -1]),
+        "obstacles_pos": np.array([pole_pos or FAR_POLE]),
+        "obstacles_visited": np.array([pole_visited]),
     }
+
+
+def min_pole_distance(planner: CenterlinePlanner, pole_pos: list[float]) -> float:
+    """Smallest horizontal distance of the centerline to the pole's axis."""
+    reference = planner.plan(track_obs(pole_pos=pole_pos))
+    points = reference.path(np.arange(0.0, reference.length, 0.005))
+    return float(np.min(np.linalg.norm(points[:, :2] - np.array(pole_pos[:2]), axis=1)))
 
 
 @pytest.mark.unit
 def test_centerline_passes_gate_centers_along_signed_normals():
-    planner = CenterlinePlanner(track_obs())
+    planner = CenterlinePlanner(track_obs(), CONFIG)
     reference = planner.plan(track_obs())
     obs = track_obs()
     np.testing.assert_allclose(reference.path(planner.gate_progress), obs["gates_pos"], atol=2e-3)
@@ -50,12 +75,12 @@ def test_centerline_passes_gate_centers_along_signed_normals():
     np.testing.assert_allclose(tangents, [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0]], atol=1e-2)
     # The path starts at the drone and runs past the last gate
     np.testing.assert_allclose(reference.path(0.0), obs["pos"], atol=1e-6)
-    assert reference.length > planner.gate_progress[-1] + 1.5
+    assert reference.length > planner.gate_progress[-1] + 0.9
 
 
 @pytest.mark.unit
 def test_centerline_rebuilds_on_revealed_gate():
-    planner = CenterlinePlanner(track_obs())
+    planner = CenterlinePlanner(track_obs(), CONFIG)
     version = planner.plan(track_obs())._version
     # Nothing revealed: same path
     assert planner.plan(track_obs())._version == version
@@ -66,6 +91,30 @@ def test_centerline_rebuilds_on_revealed_gate():
     np.testing.assert_allclose(reference.path(planner.gate_progress[1]), [3.1, 2.0, 1.1], atol=2e-3)
     # The start stays fixed
     np.testing.assert_allclose(reference.path(0.0), track_obs()["pos"], atol=1e-6)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("pole_pos", [[0.0, 0.0, 1.55], [0.0, 0.05, 1.55], [0.5, -0.03, 1.55]])
+def test_centerline_bends_around_poles(pole_pos: list[float]):
+    # The straight centerline to the first gate runs along y = 0, through or next to the pole
+    planner = CenterlinePlanner(track_obs(pole_pos=pole_pos), CONFIG)
+    assert min_pole_distance(planner, pole_pos) >= POLE_CLEARANCE + 0.04
+    # It still passes the gates' centers
+    reference = planner.plan(track_obs(pole_pos=pole_pos))
+    np.testing.assert_allclose(
+        reference.path(planner.gate_progress), track_obs()["gates_pos"], atol=2e-3
+    )
+
+
+@pytest.mark.unit
+def test_centerline_rebuilds_on_revealed_pole():
+    planner = CenterlinePlanner(track_obs(), CONFIG)
+    version = planner.plan(track_obs())._version
+    revealed = track_obs(pole_pos=[0.0, 0.0, 1.55], pole_visited=True)
+    reference = planner.plan(revealed)
+    assert reference._version != version
+    points = reference.path(np.arange(0.0, reference.length, 0.005))
+    assert np.min(np.linalg.norm(points[:, :2], axis=1)) >= POLE_CLEARANCE + 0.04
 
 
 @pytest.mark.unit
@@ -124,8 +173,17 @@ def test_tunnel_corners_span_square():
 
 
 def cost_inputs(half_width: float = 1.0, **weights: float) -> dict:
-    """MPCC++ weights with overrides and a constant tunnel half-width on `straight_path`."""
-    return {"weights": {**MPCC_PP_WEIGHTS, **weights}, "half_width": jnp.full(1001, half_width)}
+    """MPCC++ weights with overrides and a constant tunnel half-width on `straight_path`.
+
+    The only gate is revealed and far away, so there is no slowdown.
+    """
+    return {
+        "weights": {**MPCC_PP_WEIGHTS, **weights},
+        "half_width": jnp.full(1001, half_width),
+        "gates_pos": jnp.array([[100.0, 0.0, 1.0]]),
+        "gates_revealed": jnp.array([True]),
+        "slow_radius": 1.0,
+    }
 
 
 def rollout(offset: list[float], v_theta: float = 0.0, horizon: int = 2) -> dict:
@@ -188,3 +246,24 @@ def test_mpcc_pp_cost_jit_and_vmap():
     )
     expected = [mpcc_pp_cost(**b, cost_inputs=inputs) for b in batch]
     np.testing.assert_allclose(costs, expected, rtol=1e-5)
+
+
+@pytest.mark.unit
+def test_progress_speed_weight_rises_near_unrevealed_gates():
+    weights = {**MPCC_PP_WEIGHTS, "r_v_theta": 2.0, "r_v_theta_unrevealed": 8.0}
+    gates = jnp.array([[0.0, 0.0, 1.0], [5.0, 0.0, 1.0]])
+    path_pos = jnp.array([[0.5, 0.0, 3.0], [2.5, 0.0, 1.0], [5.5, 0.0, 1.0]])
+    unrevealed = progress_speed_weight(path_pos, gates, jnp.array([False, False]), 1.0, weights)
+    # Within the slow radius (horizontally, the height does not count) and far from both gates
+    np.testing.assert_allclose(unrevealed, [10.0, 2.0, 10.0], atol=0.1)
+    revealed = progress_speed_weight(path_pos, gates, jnp.array([True, False]), 1.0, weights)
+    np.testing.assert_allclose(revealed, [2.0, 2.0, 10.0], atol=0.1)
+    # Halfway up at the slow radius
+    at_radius = progress_speed_weight(
+        jnp.array([1.0, 0.0, 1.0]), gates, ~jnp.zeros(2, bool), 1.0, weights
+    )
+    np.testing.assert_allclose(at_radius, 2.0, atol=1e-3)
+    halfway = progress_speed_weight(
+        jnp.array([1.0, 0.0, 1.0]), gates, jnp.zeros(2, bool), 1.0, weights
+    )
+    np.testing.assert_allclose(halfway, 6.0, atol=1e-3)

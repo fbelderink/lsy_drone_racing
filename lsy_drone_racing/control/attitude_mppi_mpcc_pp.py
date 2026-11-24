@@ -13,6 +13,15 @@ from lsy_drone_racing.control.mpcc.cost_pp import CorridorObjective
 from lsy_drone_racing.control.mpcc.mppi_mpcc import MPPIMPCC
 from lsy_drone_racing.control.planner.centerline import CenterlinePlanner
 
+# Window in meters (behind, ahead) around the old progress in which the progress is searched on a
+# rebuilt centerline. Rebuilds start at the same point and change the arc length near the drone by a
+# few decimeters, while a global search can jump to another section where the track crosses itself.
+CARRY_WINDOW = (0.5, 1.0)
+# Extra radius in meters in the rollouts' gate contact check: the corners of the drone's collision
+# box reach 0.099 m horizontally, beyond its 0.086 m collision sphere. MPCC++ flies close to gate
+# frames, so the difference matters.
+GATE_MARGIN = 0.02
+
 if TYPE_CHECKING:
     import numpy as np
     from crazyflow import Sim
@@ -31,8 +40,15 @@ class AttitudeMPPIMPCCPP(Controller):
             config: The race configuration.
         """
         super().__init__(obs, info, config)
-        planner = CenterlinePlanner(obs)
-        self._mpcc = MPPIMPCC(obs, config, planner, CorridorObjective(config, planner))
+        planner = CenterlinePlanner(obs, config)
+        self._mpcc = MPPIMPCC(
+            obs,
+            config,
+            planner,
+            CorridorObjective(config, planner),
+            carry_window=CARRY_WINDOW,
+            gate_margin=GATE_MARGIN,
+        )
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None

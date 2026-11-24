@@ -68,23 +68,33 @@ def path_lookup(path: ArcLengthPath, theta: Array) -> tuple[Array, Array]:
     return positions, tangents / jnp.linalg.norm(tangents, axis=-1, keepdims=True)
 
 
-def carry_progress(old_path: ArcLengthPath, theta: float, new_reference: PathReference) -> float:
+def carry_progress(
+    old_path: ArcLengthPath,
+    theta: float,
+    new_reference: PathReference,
+    search_range_s: tuple[float, float] | None = None,
+) -> float:
     """Convert a progress on a replaced path to the progress on its replacement.
 
     Arc lengths are not comparable between paths, e.g. a path re-planned from the drone's current
-    position starts again at zero. The point at theta on the old path is projected onto the whole
-    new path instead.
+    position starts again at zero. The point at theta on the old path is projected onto the new
+    path instead.
 
     Args:
         old_path: The path before the replan.
         theta: Progress in meters on the old path.
         new_reference: The re-planned path.
+        search_range_s: (behind, ahead) window in meters around theta to search on the new path,
+            for paths whose arc length changes little near the drone, e.g. paths with the same
+            start. None searches the whole new path.
 
     Returns:
         The progress in meters on the new path.
     """
     old_point = np.asarray(path_lookup(old_path, jnp.float32(theta))[0])
-    return new_reference.get_progress(old_point)
+    if search_range_s is None:
+        return new_reference.get_progress(old_point)
+    return new_reference.get_progress(old_point, prev_progress=theta, search_range_s=search_range_s)
 
 
 def speed_profile(

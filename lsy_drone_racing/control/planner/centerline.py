@@ -1,12 +1,14 @@
 """Centerline through the gate centers, the reference path of MPCC++ (Krinner, Romero et al., 2024).
 
-The centerline is a Hermite spline that passes every gate center along the gate's normal. It does
-not avoid obstacles or the gate frames: it is the axis of the tunnel of `mpcc/corridor.py`, and the
-controller is free to deviate from it within the tunnel.
+The centerline is a Hermite spline that passes every gate center along the gate's normal. It is
+the axis of the tunnel of `mpcc/corridor.py`, and the controller is free to deviate from it within
+the tunnel. The paper's tracks have no obstacles; here the centerline bends around the poles, so
+the tunnel does not lead the drone straight into one, e.g. when a pole stands in front of a gate.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -14,11 +16,27 @@ import numpy.linalg as la
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control.planner.reference import Reference
+from lsy_drone_racing.control.utils.collision import gate_contact
+from lsy_drone_racing.control.utils.utils import drone_collision_radius, obstacle_radius
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
-OVERSHOOT = 2.0  # Length in meters of the straight extension past the last gate
+logger = logging.getLogger(__name__)
+
+OVERSHOOT = 1.0  # Length in meters of the straight extension past the last gate
+# Horizontal clearance in meters between the drone's and a pole's collision spheres that the
+# centerline keeps
+POLE_MARGIN = 0.05
+# Distance in meters beyond the drone's radius from a gate's frame within which the centerline
+# counts as close to the frame. A detour around a pole goes to the side where less of the centerline
+# is close to a frame, e.g. not between the pole and a gate's plane.
+FRAME_MARGIN = 0.1
+# Extra distance in meters by which a detour knot is pushed out, so the spline through it keeps the
+# clearance also next to the knot
+DETOUR_EXTRA = 0.03
+MAX_DETOURS = 8  # Maximum number of detour knots added in one build
+CHECK_SPACING = 0.01  # Arc-length spacing in meters at which the centerline is checked for poles
 
 
 def centerline_knots(
@@ -27,7 +45,7 @@ def centerline_knots(
     gates_direction: NDArray[np.floating],
     overshoot: float,
 ) -> tuple[NDArray[np.floating], NDArray[np.floating]]:
-    """Knots and unit tangents of the centerline.
+    """Knots and unit tangents of the centerline through the gates.
 
     The knots are the start, the gate centers and a point `overshoot` past the last gate, so the
     planning horizon does not run off the path's end right after the last gate.
@@ -51,33 +69,94 @@ def centerline_knots(
     return knots, tangents
 
 
+def closest_pole_conflict(
+    reference: Reference, poles_pos: NDArray[np.floating], clearance: float
+) -> tuple[float, NDArray[np.floating]] | None:
+    """Find the deepest point where the centerline comes closer to a pole than the clearance.
+
+    Poles are vertical, so only the horizontal distance counts.
+
+    Args:
+        reference: The centerline.
+        poles_pos: Pole positions with shape (n_poles, 3).
+        clearance: Required horizontal distance in meters from a pole's axis.
+
+    Returns:
+        None if the centerline keeps the clearance everywhere. Otherwise the arc length in meters of
+        the deepest point, and two candidate detour knots with shape (2, 3): that point pushed
+        horizontally and perpendicular to the path to the clearance plus DETOUR_EXTRA from the pole,
+        first on the side of the pole the path is already on, then on the other side.
+    """
+    s = np.arange(0.0, reference.length, CHECK_SPACING)
+    points = reference.path(s)
+    offsets = points[:, None, :2] - poles_pos[None, :, :2]  # (n_points, n_poles, 2)
+    distance = la.norm(offsets, axis=-1)
+    i, pole = np.unravel_index(np.argmin(distance - clearance), distance.shape)
+    if distance[i, pole] >= clearance:
+        return None
+
+    # Push sideways, perpendicular to the path. Pushing along the offset to the pole instead fails
+    # when the path runs through the pole's axis, where that offset's direction is arbitrary.
+    tangent = reference.path(s[i], 1)[:2]
+    tangent = tangent / la.norm(tangent)
+    left = np.array([-tangent[1], tangent[0]])
+    side = 1.0 if np.dot(offsets[i, pole], left) >= 0 else -1.0
+    along = np.dot(offsets[i, pole], tangent)
+    knots = np.tile(points[i], (2, 1))
+    for knot, knot_side in zip(knots, (side, -side)):
+        knot[:2] = (
+            poles_pos[pole, :2] + along * tangent + knot_side * (clearance + DETOUR_EXTRA) * left
+        )
+    return float(s[i]), knots
+
+
+def gate_frame_proximity(reference: Reference, gates: NDArray[np.floating], radius: float) -> float:
+    """Length of the centerline that comes closer than radius to a gate's frame or stand.
+
+    Args:
+        reference: The centerline.
+        gates: Position and normal vector of every gate with shape (n_gates, 6).
+        radius: Distance in meters from the frame that counts as close.
+
+    Returns:
+        The length in meters.
+    """
+    points = reference.path(np.arange(0.0, reference.length, CHECK_SPACING))
+    return CHECK_SPACING * float(np.sum(gate_contact(points, gates, radius)))
+
+
 class CenterlinePlanner:
     """Plans the centerline from the start position through the gates in their sequence.
 
-    When a gate's true pose is revealed, the whole centerline is rebuilt from the same start, so
-    the tunnel always describes the track and not the drone's current state.
+    When a gate's or a pole's true pose is revealed, the whole centerline is rebuilt from the same
+    start, so the tunnel always describes the track and not the drone's current state.
     """
 
     # The centerline always starts at the drone's initial position, so the progress is projected
     # onto a new centerline instead of restarting at zero
     starts_at_drone = False
 
-    def __init__(self, obs: dict[str, NDArray[np.floating]]):
-        """Plan the centerline through the gates' poses in the initial observation.
+    def __init__(self, obs: dict[str, NDArray[np.floating]], config: dict):
+        """Plan the centerline through the gates' and poles' poses in the initial observation.
 
         Args:
             obs: The initial observation of the environment's state.
+            config: The race configuration.
         """
         self._start = np.array(obs["pos"], dtype=float)
         self._gate_sequence = np.asarray(obs["gate_sequence"])
         self._gate_sequence_direction = np.asarray(obs["gate_sequence_direction"], dtype=float)
         self._gates_visited = np.array(obs["gates_visited"])
+        self._obstacles_visited = np.array(obs["obstacles_visited"])
+        self._pole_clearance = drone_collision_radius(config.sim.drone) + obstacle_radius()
+        self._pole_clearance += POLE_MARGIN
+        self._frame_radius = drone_collision_radius(config.sim.drone) + FRAME_MARGIN
         self._reference = None
         self.gate_progress = None  # Arc length of every gate crossing in meters, shape (n,)
         self._build(obs)
 
     def plan(self, obs: dict[str, NDArray[np.floating]]) -> Reference:
-        """Return the centerline, rebuilt if the observation revealed a gate's true pose.
+        """Return the centerline, rebuilt if the observation revealed a gate's or pole's pose.
 
         Args:
             obs: The current observation of the environment.
@@ -85,22 +164,52 @@ class CenterlinePlanner:
         Returns:
             The current centerline.
         """
-        if np.any(obs["gates_visited"] & ~self._gates_visited):
+        new_gates = np.any(obs["gates_visited"] & ~self._gates_visited)
+        new_obstacles = np.any(obs["obstacles_visited"] & ~self._obstacles_visited)
+        if new_gates or new_obstacles:
             self._gates_visited = np.array(obs["gates_visited"])
+            self._obstacles_visited = np.array(obs["obstacles_visited"])
             self._build(obs)
         return self._reference
 
     def _build(self, obs: dict[str, NDArray[np.floating]]):
-        """Build the centerline through the gate poses of the observation."""
+        """Build the centerline through the gate poses, around the poles of the observation."""
         gates_pos = np.asarray(obs["gates_pos"])[self._gate_sequence]
         normals = R.from_quat(np.asarray(obs["gates_quat"])[self._gate_sequence]).apply([1, 0, 0])
         directions = normals * self._gate_sequence_direction[:, None]
         knots, tangents = centerline_knots(self._start, gates_pos, directions, OVERSHOOT)
-        # Zero second derivatives at the knots, so the centerline is straight through the gates
-        accelerations = np.zeros_like(tangents)
+        is_gate = np.zeros(len(knots), dtype=bool)
+        is_gate[1:-1] = True
+
+        poles_pos = np.asarray(obs["obstacles_pos"])
+        all_normals = R.from_quat(np.asarray(obs["gates_quat"])).apply([1, 0, 0])
+        gates = np.hstack((np.asarray(obs["gates_pos"]), all_normals))
+        reference = Reference(knots, tangents, np.zeros_like(tangents))
+        conflict = closest_pole_conflict(reference, poles_pos, self._pole_clearance)
+        n_detours = 0
+        while conflict is not None and n_detours < MAX_DETOURS:
+            s, candidates = conflict
+            # Insert the detour knot between the knots around it, keeping the local direction
+            index = int(np.searchsorted(reference.sparse_s, s))
+            tangent = reference.path(s, 1)
+            tangents = np.insert(tangents, index, tangent / la.norm(tangent), axis=0)
+            is_gate = np.insert(is_gate, index, False)
+            options = []
+            for knot in candidates:
+                option_knots = np.insert(knots, index, knot, axis=0)
+                option = Reference(option_knots, tangents, np.zeros_like(tangents))
+                proximity = gate_frame_proximity(option, gates, self._frame_radius)
+                options.append((proximity, option.length, option_knots, option))
+            # Least of the centerline near a gate frame, then the shortest
+            _, _, knots, reference = min(options, key=lambda option: option[:2])
+            conflict = closest_pole_conflict(reference, poles_pos, self._pole_clearance)
+            n_detours += 1
+        if conflict is not None:
+            logger.warning("Centerline still passes a pole after %d detours", MAX_DETOURS)
+
         if self._reference is None:
-            self._reference = Reference(knots, tangents, accelerations)
+            self._reference = reference
         else:
             # Rebuilt in place, which increments the reference's version
-            self._reference._update(knots, tangents, accelerations)
-        self.gate_progress = self._reference.sparse_s[1:-1]
+            self._reference._update(knots, tangents, np.zeros_like(tangents))
+        self.gate_progress = self._reference.sparse_s[is_gate]
