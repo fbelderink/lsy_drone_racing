@@ -1,267 +1,143 @@
-"""Planner to which generates paths through control points"""
+"""JAX implementation of splines."""
 
-import numpy as np
-import numpy.linalg as la
-from scipy.interpolate import PPoly
-from scipy.spatial.transform import Rotation as R
+from dataclasses import dataclass, field
 
-from lsy_drone_racing.control.planner.reference import Reference
-from lsy_drone_racing.control.utils.types import ObservationDict
-from lsy_drone_racing.control.utils.utils import (
-    dist_to_segment,
-    drone_collision_radius,
-    obstacle_radius,
-)
+import jax
+import jax.numpy as jnp
+from jax import Array
 
 
-class SplinePlanner:
-    """Spline Planner through the gates which pushes the path away from obstacles"""
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class Spline:
+    """Piecewise polynomial in the Bernstein basis.
 
-    def __init__(self, obs: ObservationDict, config: dict):
-        """Args:
-        obs: Initial observation.
-        config: Environment config.
-        """
-        self.config = config
+    Segment k covers [knots[k], knots[k+1]] and is evaluated in the local coordinate
+    t = (x - knots[k]) / h_k in [0, 1].
 
-        self.gate_sequence = obs["gate_sequence"]
-        self.gate_sequence_dir = obs["gate_sequence_direction"]
+    Evaluation is split into two parts:
+        _locate(x)         -> (k, t)   depends on the knot structure
+        _eval_local(c, t)  -> point    pure local Bernstein
+    """
 
-        self.obstacles_visited = obs["obstacles_visited"]
-        self.gates_visited = obs["gates_visited"]
+    coeffs: Array  # (n_seg, degree+1, dim)
+    knots: Array  # (n_seg+1,)
+    degree: int = field(metadata=dict(static=True))
+    uniform: bool = field(default=False, metadata=dict(static=True))
 
-        self.is_track_randomized = self.config.env.track.randomize
-        self._current_reference = None
+    @property
+    def n_seg(self) -> int:
+        """Number of segments (static, derived from the shape)."""
+        return self.coeffs.shape[0]
 
-        self.ds = 0.01  # reference is sampled every ds [m]
-        margin = 0.04  # safety margin for collisions
+    def eval(self, x: Array) -> Array:
+        """x: any shape (...) -> (..., dim)."""
+        return jnp.vectorize(self._eval_scalar, signature="()->(d)")(x)
 
-        d_r = drone_collision_radius(config.sim.drone)
-        o_r = obstacle_radius()
-
-        self.obstacle_clearance = d_r + o_r + margin
-        self.gate_clearance_inside = 0.2 - d_r - margin
-        self.gate_clearance_outside = 0.36 + d_r + margin
-
-    def plan(self, obs: ObservationDict) -> Reference:
-
-        if self._current_reference is None:
-            # initial path
-            if not self.is_track_randomized:
-                self._current_reference = Reference.default_reference(obs)
-            else:
-                self._current_reference = Reference(
-                    *self.find_waypoints(obs)
-                )  # compute waypoints from gate positions
-
-            return self._current_reference
-
-        updated_obstacles = np.flatnonzero(obs["obstacles_visited"] & ~self.obstacles_visited)
-        updated_gates = np.flatnonzero(obs["gates_visited"] & ~self.gates_visited)
-
-        if updated_gates.size > 0:
-            # update gates visited
-            self.gates_visited = obs["gates_visited"].copy()
-            self._handle_gates_update(obs, updated_gates)
-
-        if updated_obstacles.size > 0:
-            # update obstacles visited
-            self.obstacles_visited = obs["obstacles_visited"].copy()
-            self._handle_obstacle_update(obs, updated_obstacles)
-
-        # TODO handle points close to plane as well (+ joint handling of obstacles and gate frames)
-
-        # return path segment to track
-        return self._current_reference
-
-    def _handle_gates_update(self, obs, updated_gates):
-        """Returns the updated sparse curve (knots, tangents, accs) or None if the current reference
-        is still valid.
-        """
-        assert updated_gates.size > 0
-        forward, other = self.gate_plane_crossings(obs, updated_gates)
-
-        # project to closest point inside
-        safe_points = self.closest_safe_point_inside(forward, obs)
-        self._current_reference.update(safe_points, forward["s"])
-
-        inside_mask = np.max(np.abs(other["offset"]), axis=-1) <= 0.2 + 0.08
-
-        if inside_mask.any():
-            safe_points = self.closest_safe_point_inside(other, obs)
-            self._current_reference.update(safe_points[inside_mask], other["s"][inside_mask])
-
-        safe_points, _ = self.closest_safe_point_outside(other, obs)
-        self._current_reference.update(safe_points[~inside_mask], other["s"][~inside_mask])
-
-    def _handle_obstacle_update(self, obs, new_obstacles, eps=0.01):
-        # TODO: only handles collision of the path in one place
-        obstacle_pos = obs["obstacles_pos"][new_obstacles]
-        ref = self._current_reference
-
-        dist = self.min_distance_to_obstacles(obstacle_pos, ref._dense_knots)[..., 0]
-        path_collides = (dist < self.obstacle_clearance).any()
-
-        if not path_collides:
-            return
-
-        min_i = np.argmin(dist, axis=0)
-
-        closest = ref._dense_knots[min_i]
-        dir_vec = (closest - obstacle_pos) * np.array([1.0, 1.0, 0.0])
-        dir_vec = dir_vec / la.norm(dir_vec, axis=-1)[..., None]
-
-        clearance = self.obstacle_clearance + eps
-
-        safe_points = closest + clearance * dir_vec
-        s = ref.path.x[min_i]
-
-        self._current_reference.update(safe_points, s)
-
-    def find_waypoints(self, obs, tangent_scale=1.0, overshoot=1.0) -> tuple:
-        ego_pos = obs["pos"]
-        ego_vel = obs["vel"]
-
-        gates_pos = obs["gates_pos"]
-        gates_quat = obs["gates_quat"]
-
-        gates = gates_pos[self.gate_sequence]
-        normals = R.from_quat(gates_quat[self.gate_sequence]).apply([1.0, 0.0, 0.0])
-        normals *= self.gate_sequence_dir[:, None]
-
-        # stack ego position, gate positions and an extension along the normal of the final gate for control points
-        pts = np.vstack([ego_pos, gates, gates[-1] + overshoot * normals[-1]])
-
-        start_dir = ego_vel if la.norm(ego_vel) > 0.1 else pts[1] - pts[0]
-        tangents = tangent_scale * np.vstack([start_dir / la.norm(start_dir), normals, normals[-1]])
-        accs = np.zeros_like(tangents)  # straight through the gates
-
-        return pts, tangents, accs
-
-    def gate_plane_crossings(self, obs, gates_to_check, search_radius=0.4):
-        """Find where the current reference crosses the planes of the given gates.
-
-        Crossings are split into
-            forward: crossings in a direction the gate has to be passed in according to the gate
-                sequence and close to the gate (within search_radius in the gate plane). These
-                have to lie inside the safe opening.
-            other: all remaining crossings (wrong direction or far away from the gate). These only
-                must not hit the frame.
-
-        Args:
-            obs: Current observation.
-            gates_to_check: (G,) gate ids.
-            search_radius: Max. offset [m] (per axis, in the gate plane) for a crossing in the
-                required direction to count as a pass of that gate.
+    def _eval_scalar(self, x: Array) -> Array:
+        """Evaluate the spline at a scalar parameter x.
 
         Returns:
-            forward, other: dicts with
-                s: (C,) progress of the crossing on the reference
-                gate: (C,) gate id
-                offset: (C, 2) (y, z) of the crossing point in the gate frame
+            (dim,) point on the curve.
         """
-        gates_pos = obs["gates_pos"][gates_to_check]  # (G, 3)
-        gates_quat = obs["gates_quat"][gates_to_check]  # (G, 4)
-        spline = self._current_reference.path
+        k, t = self._locate(x)
+        return self._eval_local(self.coeffs[k], t)
 
-        rot = R.from_quat(gates_quat)
-        normals = rot.apply([1.0, 0.0, 0.0])  # (G, 3)
+    def derivative(self) -> "Spline":
+        """Derivative with respect to the global parameter x, as a new spline of degree-1.
 
-        # signed distance to every gate plane as one piecewise polynomial with G columns
-        c = spline.c @ normals.T  # (4, m, 3) @ (3, G) -> (4, m, G)
-        c[-1] -= np.sum(normals * gates_pos, axis=1)  # subtract n_g · g_g in the constant term
-        f = PPoly(c, spline.x)
+        Bernstein derivative: n * (c[j+1] - c[j]) are the coefficients w.r.t. t,
+        and the chain rule d/dx = (1/h_k) d/dt adds the per-segment 1/h.
+        """
+        if self.degree == 0:  # static check, fine under jit
+            raise ValueError("Cannot differentiate a degree-0 spline.")
+        h = jnp.diff(self.knots)  # (n_seg,)
+        dc = self.degree * (self.coeffs[:, 1:] - self.coeffs[:, :-1]) / h[:, None, None]
+        return Spline(coeffs=dc, knots=self.knots, degree=self.degree - 1, uniform=self.uniform)
 
-        roots = f.roots(extrapolate=False)  # (G,) object array, one root array per gate
+    def _locate(self, x: Array) -> tuple[Array, Array]:
+        """Find segment index k and local coordinate t for parameter x."""
+        if self.uniform:
+            h = self.knots[1] - self.knots[0]
+            k = jnp.floor((x - self.knots[0]) / h).astype(jnp.int32)  # O(1)
+        else:
+            k = jnp.searchsorted(self.knots, x, side="right") - 1  # O(log n)
+        k = jnp.clip(k, 0, self.n_seg - 1)
+        t = (x - self.knots[k]) / (self.knots[k + 1] - self.knots[k])
+        return k, t
 
-        # flatten into one list of crossings
-        s_cross = np.concatenate(roots)  # (C,)
-        gate_idx = np.repeat(
-            np.arange(len(roots)), [len(r) for r in roots]
-        )  # (C,) index into gates_to_check
+    @staticmethod
+    def _eval_local(c: Array, t: Array) -> Array:
+        """Evaluate one Bernstein polynomial with coefficients c (degree+1, dim) at t.
 
-        # (y, z) of the crossing point relative to the gate center in the gate frame
-        local = rot[gate_idx].apply(spline(s_cross) - gates_pos[gate_idx], inverse=True)
-        offset = local[:, 1:]  # (C, 2)
+        De Casteljau: repeated lerps between neighbouring control points. The loop runs
+        over the static degree, so it is unrolled at trace time.
 
-        # +1 if the path crosses along the gate normal (-x -> +x), -1 for the reverse
-        slope = f.derivative()(s_cross)[np.arange(len(s_cross)), gate_idx]
-        crossing_dir = np.sign(slope)
+        """
+        for _ in range(c.shape[0] - 1):
+            c = (1.0 - t) * c[:-1] + t * c[1:]
+        return c[0]
 
-        # a crossing is forward if any pass of its gate in the sequence requires this direction
-        passes = self.gate_sequence[None, :] == gates_to_check[:, None]  # (G, P)
-        dir_matches = self.gate_sequence_dir[None, :] == crossing_dir[:, None]  # (C, P)
-        required_dir = (passes[gate_idx] & dir_matches).any(axis=1)  # (C,)
+    @classmethod
+    def from_hermite(
+        cls, u: Array, p: Array, v: Array, a: Array, uniform: bool = False
+    ) -> "Spline":
+        """Create a quintic Hermite spline from knot positions, velocities and accelerations.
 
-        # and it is within a given search radius
-        near = np.all(np.abs(offset) < search_radius, axis=1)
-        forward = required_dir & near
+        Args:
+            u: (K,) strictly increasing knots.
+            p: (K, dim) positions at the knots.
+            v: (K, dim) first derivative w.r.t. u at the knots.
+            a: (K, dim) second derivative w.r.t. u at the knots.
+            uniform: Set True only if the knots are equally spaced (enables O(1) lookup).
+        """
+        u = jnp.asarray(u)
+        return cls(coeffs=quintic_hermite(u, p, v, a), knots=u, degree=5, uniform=uniform)
 
-        def select(mask):
-            return dict(
-                s=s_cross[mask],
-                gate=gates_to_check[gate_idx[mask]],
-                offset=offset[mask],
-                dir=crossing_dir[mask],
-            )
 
-        return select(forward), select(~forward)
+def quintic_hermite(u: Array, p: Array, v: Array, a: Array) -> Array:
+    """Compute coefficients of quintic hermite spline in the bernstein basis.
 
-    def closest_safe_point_inside(self, d, obs, eps=0.04):
+    Args:
+        u: (K, ) strictly increasing knots
+        p: (K, dim) positions at the knots
+        v: (K, dim) first derivative w.r.t. u at the knots
+        a: (K, dim) second derivative w.r.t. u at the knots
 
-        gate_indices = d["gate"]
+    Returns:
+        cofficients of the spline in bernstein basis.
+    """
 
-        gates_pos = obs["gates_pos"][gate_indices]
-        rot = R.from_quat(obs["gates_quat"][gate_indices])
+    def segment_interpolation(u: Array, p: Array, v: Array, a: Array) -> Array:
+        """Interpolate quintic spline in segment between two points.
 
-        clearance = self.gate_clearance_inside - eps
+        We parameterize in the local frame by t = (x - u[0]) / h in [0, 1]
+        With that compute closed form solutions for beta_0, ..., beta_5
 
-        safe_yz = np.clip(d["offset"], -clearance, clearance)
-        safe_local = np.column_stack([np.zeros(len(safe_yz)), safe_yz])  # (x, y, z) with x=0
-        safe_world = gates_pos + rot.apply(safe_local)
+        Args:
+        u: (2, ) start and end knot
+        p: (2, dim) positions at the knots
+        v: (2, dim) first derivative w.r.t. u at the knots
+        a: (2, dim) second derivative w.r.t. u at the knots
 
-        moved = (safe_yz != d["offset"]).any(axis=-1)
+        Returns:
+        (6, dim) coefficients in the bernstein basis of a quintic polynomial.
+        """
+        h = u[1] - u[0]
 
-        return safe_world
+        beta_0 = p[0]
+        beta_1 = p[0] + (h / 5) * v[0]
+        beta_2 = p[0] + 2 * (h / 5) * v[0] + (h * h / 20) * a[0]
 
-    def closest_safe_point_outside(self, d, obs, eps=0.02):
+        beta_5 = p[1]
+        beta_4 = p[1] - (h / 5) * v[1]
+        beta_3 = p[1] - 2 * (h / 5) * v[1] + (h * h / 20) * a[1]
 
-        gate_indices = d["gate"]
-        gates_pos = obs["gates_pos"][gate_indices]
-        rot = R.from_quat(obs["gates_quat"][gate_indices])
+        return jnp.stack([beta_0, beta_1, beta_2, beta_3, beta_4, beta_5], dtype=p.dtype)
 
-        clearance = self.gate_clearance_outside + eps
-        offset = d["offset"]  # (C, 2)
-        y, z = offset[:, 0], offset[:, 1]
+    u_pairs = jnp.stack([u[:-1], u[1:]], axis=1)
+    p_pairs = jnp.stack([p[:-1], p[1:]], axis=1)
+    v_pairs = jnp.stack([v[:-1], v[1:]], axis=1)
+    a_pairs = jnp.stack([a[:-1], a[1:]], axis=1)
 
-        # shift needed to leave the square over each edge: right (+y), left (-y), top (+z), bottom (-z)
-        shifts = np.stack(
-            [clearance - y, clearance + y, clearance - z, clearance + z], axis=1
-        )  # (C, 4)
-
-        # leaving over the bottom edge would put the point onto the stand (|y| < 0.05 below the frame)
-        on_stand = np.abs(y) < 0.05 + self.gate_clearance_outside - 0.36
-        shifts[on_stand, 3] = np.inf
-
-        # push out over the nearest allowed edge, points that are already outside are not moved
-        edge = np.argmin(shifts, axis=1)
-        moved = np.max(np.abs(offset), axis=1) < clearance
-
-        safe_yz = offset.copy()
-        rows = np.flatnonzero(moved)
-        axis = edge[rows] // 2  # 0: y, 1: z
-        sign = np.where(edge[rows] % 2 == 0, 1.0, -1.0)
-        safe_yz[rows, axis] = sign * clearance
-
-        safe_local = np.column_stack([np.zeros(len(safe_yz)), safe_yz])  # (x, y, z) with x=0
-        safe_world = gates_pos + rot.apply(safe_local)
-
-        return safe_world, moved
-
-    def min_distance_to_obstacles(self, obstacle_pos, waypoints):
-
-        return dist_to_segment(
-            waypoints,
-            obstacle_pos * np.array([1.0, 1.0, 0.0]),  # set z component to zero,
-            obstacle_pos,
-        )
+    return jax.vmap(segment_interpolation)(u_pairs, p_pairs, v_pairs, a_pairs)
