@@ -1,8 +1,15 @@
-"""Reference"""
+"""Reference path of the high level planner, parameterized by its progress (arc length) s.
+
+The path is a quintic Hermite spline through labelled knots: the start, the gates, the final
+waypoint (all fixed) and extra waypoints that the planner inserts or replaces, e.g. to push the
+path away from obstacles. Knots are parameterized by chord length first, then the spline is
+resampled densely and refitted in arc length, so that s measures the distance along the path.
+
+References are immutable: every update returns a new reference.
+"""
 
 from __future__ import annotations
 
-import warnings
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -23,17 +30,6 @@ def quintic_hermite(u: NDArray, p: NDArray, v: NDArray, a: NDArray) -> BPoly:
     return curve
 
 
-# LAYOUT
-def num_slots(n_gates: int, n_extra: int) -> int:
-    """Number of slots for waypoints in reference."""
-    return 2 + n_gates + n_gates * n_extra
-
-
-def gate_slot(gate_idx: int | NDArray, n_gates: int, n_extra: int) -> int | NDArray:
-    """Slot index of the i-th gate in the sequnce."""
-    return np.clip(1 + n_extra + (n_extra + 1) * gate_idx, 0, num_slots(n_gates, n_extra) - 1)
-
-
 def arclen_derivs(dp_du: NDArray, d2p_du2: NDArray) -> tuple[NDArray, NDArray]:
     """Apply chain rule to get arclength derivatives from derivatives w.r.t. chord length u."""
     ds_du = la.norm(dp_du, axis=-1, keepdims=True)
@@ -47,34 +43,36 @@ def arclen_derivs(dp_du: NDArray, d2p_du2: NDArray) -> tuple[NDArray, NDArray]:
 class ProgressReference:
     """Progress-based reference path."""
 
+    START_END_LABEL: int = -1
+    GATES_LABEL: int = 0
+    UPDATEABLE_LABEL: int = 1
+
     def __init__(
         self,
         p: NDArray,
         v: NDArray,
         a: NDArray,
-        mask: NDArray,
+        pt_labels: NDArray,
         tangent_scale: NDArray,
-        n_gates: int,
-        n_extra: int,
         M: int = 32,
     ):
         """Initialize a progress-based reference path.
 
         Args:
-            p, v, a: (n_slots, 3) positions, tangents, accelerations of all slots
-            mask:    (n_slots, )  True = slot is active
-            n_gates, n_extra:     gates and extra slots per gap
-            M:                    table samples per segment
+            p, v, a:  positions, tangents, accelerations of all slots.
+            tangent_scale
+            pt_labels: 0: fixed, 1: extra
+            M:                    table samples per segment.
         """
-        self._p, self._v, self._a, self._mask = p, v, a, np.asarray(mask, dtype=bool)
+        self._p, self._v, self._a = p, v, a
         self._tangent_scale = tangent_scale
-        self._n_gates, self._n_extra, self._M = n_gates, n_extra, M
+        self._pt_labels = pt_labels
+        self._M = M
 
         self._build()
 
     def _build(self):
-        # compact
-        p, v, a = self._p[self._mask], self._v[self._mask], self._a[self._mask]
+        p, v, a = self._p, self._v, self._a
 
         self._u = np.append(0, np.cumsum(la.norm(np.diff(p, axis=0), axis=1)))  # (K, )
 
@@ -82,7 +80,6 @@ class ProgressReference:
         self._spline_u = quintic_hermite(self._u, p, v, a)
 
         # Reparameterization by arc length of the generated spline
-        # TODO ATTENTION: depends on the amount of points inserted (triggers recompile in jax)
         u_per_segment = np.linspace(
             self._u[:-1], self._u[1:], self._M, axis=-1, endpoint=False
         )  # (K-1, M)
@@ -105,22 +102,6 @@ class ProgressReference:
 
         self.length = self._s_samples[-1]
 
-    def _gate_slot(self, gate_idx: int | NDArray) -> int | NDArray:
-        """Slot index of the i-th gate in the sequnce."""
-        return gate_slot(gate_idx, self._n_gates, self._n_extra)
-
-    def _progress_at_slot_idx(self, slot_idx: int | NDArray) -> int | NDArray:
-        """Returns the progress at the gate for a given gate_idx."""
-        slot_idx = np.asarray(slot_idx)
-
-        knot_idx = np.cumsum(self._mask)[slot_idx] - 1
-        return self._s_samples[knot_idx * self._M]
-
-    @property
-    def num_slots(self) -> int:
-        """Number of slots for waypoints in reference."""
-        return num_slots(self._n_gates, self._n_extra)
-
     @property
     def dense_s(self) -> NDArray:
         """Dense samples in s."""
@@ -133,7 +114,6 @@ class ProgressReference:
         gates_pos_seq: NDArray,
         gates_normals: NDArray,
         tangent_scale: float | NDArray = 1.0,
-        n_extra: int = 8,
     ) -> "ProgressReference":
         """Build an initial reference.
 
@@ -142,18 +122,18 @@ class ProgressReference:
         gates_pos_seq: (n_gates, 3)
         gates_normals: (n_gates, 3)
         tangent_scale: (n_gates + 1, ) | scalar scales the gates normals
-        n_extra: number of slots between gates for adjusting the reference online
         """
         n_gates = len(gates_pos_seq)  # number of gates in the sequence
-        n_slots = num_slots(n_gates, n_extra)
         tangent_scale = np.broadcast_to(tangent_scale, (n_gates + 2,))  # +1 for ego
 
-        p = np.zeros((n_slots, 3))
+        p = np.zeros((n_gates + 2, 3))
         v = np.zeros_like(p)
         a = np.zeros_like(p)
 
-        mask = np.zeros((n_slots,), dtype=np.bool)
-        gate_slots = gate_slot(np.arange(n_gates), n_gates, n_extra)
+        pt_lables = np.zeros((n_gates + 2,))
+        pt_lables[0] = cls.START_END_LABEL
+        pt_lables[1:-1] = cls.GATES_LABEL
+        pt_lables[-1] = cls.START_END_LABEL
 
         ego_normal = gates_pos_seq[0] - ego_pos
         ego_normal = ego_normal / la.norm(ego_normal)
@@ -161,19 +141,16 @@ class ProgressReference:
         # initial position
         p[0] = ego_pos
         v[0] = tangent_scale[0, None] * ego_normal
-        mask[0] = True
 
         # gates positions
-        p[gate_slots] = gates_pos_seq
-        v[gate_slots] = tangent_scale[1:-1, None] * gates_normals
-        mask[gate_slots] = True
+        p[1:-1] = gates_pos_seq
+        v[1:-1] = tangent_scale[1:-1, None] * gates_normals
 
         # final waypoint: extend along last gates normal
         p[-1] = gates_pos_seq[-1] + gates_normals[-1]
         v[-1] = tangent_scale[-1, None] * gates_normals[-1]
-        mask[-1] = True
 
-        return cls(p, v, a, mask, tangent_scale[1:-1], n_gates, n_extra)
+        return cls(p, v, a, pt_lables, tangent_scale[1:-1])
 
     def __call__(self, s: NDArray, nu: int = 0) -> NDArray:
         """Evaluate the path at progress s.
@@ -242,37 +219,27 @@ class ProgressReference:
         """
         p, v, a = self._p.copy(), self._v.copy(), self._a.copy()
 
-        slots = self._gate_slot(np.flatnonzero(mask))
+        slots = self._get_gate_slots()[mask]
         p[slots] = gates_pos[mask]
         v[slots] = self._tangent_scale[mask, None] * gates_normals[mask]
         a[slots] = 0.0
 
         return ProgressReference(
-            p,
-            v,
-            a,
-            self._mask,
-            tangent_scale=self._tangent_scale,
-            n_gates=self._n_gates,
-            n_extra=self._n_extra,
-            M=self._M,
+            p, v, a, pt_labels=self._pt_labels, tangent_scale=self._tangent_scale, M=self._M
         )
 
     def without_extras(self) -> "ProgressReference":
         """Set mask invalid for all current extra waypoints."""
-        mask = np.zeros_like(self._mask)
-        mask[0] = True
-        mask[self._gate_slot(np.arange(self._n_gates))] = True
-        mask[-1] = True
+        p, v, a = self._p.copy(), self._v.copy(), self._a.copy()
+
+        keep = self._pt_labels != self.UPDATEABLE_LABEL
 
         return ProgressReference(
-            self._p,
-            self._v,
-            self._a,
-            mask,
+            p[keep],
+            v[keep],
+            a[keep],
+            pt_labels=self._pt_labels[keep],
             tangent_scale=self._tangent_scale,
-            n_gates=self._n_gates,
-            n_extra=self._n_extra,
             M=self._M,
         )
 
@@ -287,14 +254,7 @@ class ProgressReference:
         a[-1] = final_a
 
         return ProgressReference(
-            p,
-            v,
-            a,
-            self._mask,
-            tangent_scale=self._tangent_scale,
-            n_gates=self._n_gates,
-            n_extra=self._n_extra,
-            M=self._M,
+            p, v, a, pt_labels=self._pt_labels, tangent_scale=self._tangent_scale, M=self._M
         )
 
     def update_extras(
@@ -303,74 +263,63 @@ class ProgressReference:
         p: NDArray,
         v: NDArray,
         a: NDArray,
-        valid: NDArray | None = None,
         min_spacing: float = 0.3,
+        min_fixed_dist: float = 0.1,
     ) -> "ProgressReference":
-        """Insert extra waypoints, or replace existing ones closer than min_spacing.
+        """Insert extra waypoints, or replace existing extras closer than min_spacing.
+
+        Start, end and gate knots are never replaced: new points closer than min_fixed_dist
+        (in s) to one of them are dropped instead.
 
         Args:
             s: (n_points,) progress on the current reference where the points belong.
             p: (n_points, 3) positions.
             v: (n_points, 3) first derivatives.
             a: (n_points, 3) second derivatives.
-            valid: (n_points,) bool, only these points are used. Lets callers pass fixed shapes.
             min_spacing: Existing extras closer than this (in s) to a new point are replaced.
+            min_fixed_dist: New points closer than this (in s) to a fixed knot are dropped.
 
         Returns:
-            New reference with the extras of every affected gap re-packed in order of s.
+            New reference with all knots ordered by their progress s.
         """
         s = np.asarray(s)
-        if valid is not None:
-            # NumPy-only: the variable-size selection below is what a JAX port replaces with masks
-            s, p, v, a = s[valid], p[valid], v[valid], a[valid]
+        s_knots = self._s_samples[:: self._M]  # (K,) progress of every knot
+        is_extra = self._pt_labels == self.UPDATEABLE_LABEL
+
+        # fixed knots cannot give way, so new points too close to them are dropped
+        too_close = (np.abs(s[:, None] - s_knots[~is_extra][None, :]) < min_fixed_dist).any(1)
+        s, p, v, a = s[~too_close], p[~too_close], v[~too_close], a[~too_close]
         if s.size == 0:
             return self
-        P, V, A, mask = self._p.copy(), self._v.copy(), self._a.copy(), self._mask.copy()
 
-        progress = self._progress_at_slot_idx(np.arange(self.num_slots))  # (num_slots, )
-        progress = np.where(self._mask, progress, np.inf)
-        gates_progress = progress[self._gate_slot(np.arange(self._n_gates))]
-        gaps = np.searchsorted(gates_progress, s, side="right")
+        # old extras within min_spacing of a new point are replaced by it
+        near = (np.abs(s_knots[:, None] - s[None, :]) < min_spacing).any(axis=1)  # (K,)
+        keep = ~(is_extra & near)
 
-        for gap in np.unique(gaps):
-            new = np.flatnonzero(gaps == gap)
-            if gap >= self._n_gates:
-                warnings.warn(f"Dropped {len(new)} extra waypoint(s) after the last gate.")
-                continue
+        S = np.concatenate([s_knots[keep], s])
+        P = np.concatenate([self._p[keep], p])
+        V = np.concatenate([self._v[keep], v])
+        A = np.concatenate([self._a[keep], a])
+        L = np.concatenate([self._pt_labels[keep], np.full(len(s), self.UPDATEABLE_LABEL)])
 
-            slots = np.arange(self._gate_slot(gap) - self._n_extra, self._gate_slot(gap))
-            old = slots[mask[slots]]
-            # merge: a new point replaces every old one within min_spacing
-            far = np.abs(progress[old][:, None] - s[new][None, :]) >= min_spacing
-            old = old[far.all(axis=1)]
-
-            # combine old and new, sort by progress, pack into the gap from the front
-            order = np.argsort(np.concatenate([progress[old], s[new]]))
-            if len(order) > self._n_extra:
-                warnings.warn(f"Gap {gap} is full, dropped {len(order) - self._n_extra} point(s).")
-                order = order[: self._n_extra]
-            k = len(order)
-            P[slots[:k]] = np.concatenate([P[old], p[new]])[order]
-            V[slots[:k]] = np.concatenate([V[old], v[new]])[order]
-            A[slots[:k]] = np.concatenate([A[old], a[new]])[order]
-            mask[slots] = False
-            mask[slots[:k]] = True
+        order = np.argsort(S, kind="stable")
 
         return ProgressReference(
-            P,
-            V,
-            A,
-            mask,
+            P[order],
+            V[order],
+            A[order],
+            pt_labels=L[order],
             tangent_scale=self._tangent_scale,
-            n_gates=self._n_gates,
-            n_extra=self._n_extra,
             M=self._M,
         )
 
+    def _get_gate_slots(self) -> NDArray:
+        return np.flatnonzero(self._pt_labels == self.GATES_LABEL)
+
     def get_current_gate_positions(self, mask: NDArray) -> tuple:
         """Returns current positions of the gates in the reference."""
-        slots = self._gate_slot(np.flatnonzero(mask))
-        return self._p, slots
+        slots = self._get_gate_slots()[mask]
+        return self._p[slots]
 
     def sample(self, num_samples: int) -> tuple:
         """Draw num_samples points from spline equally spaced across u."""

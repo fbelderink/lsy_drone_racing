@@ -28,7 +28,7 @@ from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
 from lsy_drone_racing.control.mid_level.mid_level_controller import MidLevelController
-from lsy_drone_racing.control.planner.splines import SplinePlanner
+from lsy_drone_racing.control.planner.high_level_planner import SplinePlanner
 
 if TYPE_CHECKING:
     from crazyflow import Sim
@@ -757,9 +757,10 @@ class AttitudeMPPI(Controller):
             return
 
         # Reference path from high level planner
-        ref_path, _ = self._mlc._planner._current_reference.sample_densely(num_samples=200)
+        _, ref_path = self._mlc._planner._current_reference.sample(num_samples=200)
         draw_line(sim, ref_path, rgba=(0.0, 1.0, 0.0, 1.0))
 
+        """
         # Local reference trajectory handed to MPPI, colored by its speed
         ref_pos = self._ref[:, :3]
         colors = speed_to_rgba(np.linalg.norm(self._ref[:, 3:6], axis=1)[:-1])
@@ -792,6 +793,7 @@ class AttitudeMPPI(Controller):
         # Chosen mean action sequence, drawn last so it is on top
         draw_line(sim, mean_path, rgba=(1.0, 0.0, 1.0, 1.0), start_size=4.5, end_size=4.5)
         draw_points(sim, mean_path, rgba=(1.0, 0.0, 1.0, 1.0), size=0.01)
+        """
 
     def _track_gate_perception(self, obs: dict[str, NDArray[np.floating]]):
         """Store the previously perceived pose of every gate whose observed pose just changed."""
