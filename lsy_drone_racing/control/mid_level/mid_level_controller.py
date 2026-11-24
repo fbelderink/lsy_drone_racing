@@ -1,21 +1,29 @@
+"""Mid Level Controller generating a trajectory from a geometrical path.
+
+The trajectory is parameterized by positions and velocity
+"""
+
 import numpy as np
 import numpy.linalg as la
+from numpy.typing import NDArray
 
-from lsy_drone_racing.control.planner.reference import Reference
+from lsy_drone_racing.control.planner.high_level_planner import SplinePlanner
+from lsy_drone_racing.control.planner.reference import ProgressReference
+from lsy_drone_racing.control.utils.types import ObservationDict, Trajectory
 
 
 class MidLevelController:
     def __init__(
         self,
-        planner,
-        v_max,
-        a_long_max,
-        a_lat_max,
-        a_brake_max,
-        v_gate_max=None,
-        gate_window=0.5,
-        gate_plateau=0.0,
-        progress_window=(0.2, 0.2),
+        planner: SplinePlanner,
+        v_max: float,
+        a_long_max: float,
+        a_lat_max: float,
+        a_brake_max: float,
+        v_gate_max: float = None,
+        gate_window: float = 0.5,
+        gate_plateau: float = 0.0,
+        progress_window: tuple[float, float] = (0.2, 0.2),
     ):
 
         self._planner = planner
@@ -32,19 +40,16 @@ class MidLevelController:
         # (behind, ahead) [m] window around the predicted progress in which the path is searched
         self.progress_window = progress_window
 
-        self._current_reference_version = 0
         self._current_velocity_profile = None
 
         self._current_progress = 0.0
 
-    def get_trajectory(self, obs, horizon, dt):
+    def get_trajectory(self, obs: ObservationDict, horizon: int, dt: float) -> Trajectory:
+        """Compute trajectory of horizon H for current reference path."""
+        ref, updated = self._planner.plan(obs)
 
-        ref = self._planner.plan(obs)
-        path = ref.path
-
-        if self._current_reference_version != ref._version:
+        if updated:
             self._current_velocity_profile = self._compute_velocity_profile(ref, obs)
-            self._current_reference_version = ref._version
 
         s_k = np.zeros((horizon + 1,))
         v_k = np.zeros((horizon + 1,))
@@ -52,35 +57,37 @@ class MidLevelController:
         current_speed = la.norm(obs["vel"])
         # predict progress by integrating the velocity component along the path tangent, then
         # correct it by projecting onto the path in a small window around the prediction
-        tangent = path(self._current_progress, 1)
+        tangent = ref(self._current_progress, 1)
         tangent = tangent / max(la.norm(tangent), 1e-9)
         s_pred = np.clip(self._current_progress + dt * np.dot(obs["vel"], tangent), 0.0, ref.length)
-        s0 = ref.get_progress(obs["pos"], prev_progress=s_pred, search_range_s=self.progress_window)
+        current_progress = ref.project(obs["pos"], s_pred=s_pred)
 
-        s_k[0] = s0
+        s_k[0] = current_progress
         v_k[0] = current_speed
 
-        def velocity_profile(progress):
+        def _velocity_profile(progress: float) -> NDArray:
 
-            i = np.clip(np.searchsorted(ref.path.x, progress), 0, len(ref.path.x) - 1)
+            i = np.clip(np.searchsorted(ref.dense_s, progress), 0, len(ref.dense_s) - 1)
 
             return self._current_velocity_profile[i]
 
         for k in range(horizon):
-            v_k[k + 1] = min(velocity_profile(s_k[k]), v_k[k] + self.a_long_max * dt)
-            s_k[k + 1] = s_k[k] + v_k[k] * dt
+            v_k[k + 1] = min(_velocity_profile(s_k[k]), v_k[k] + self.a_long_max * dt)
+            s_k[k + 1] = s_k[k] + v_k[k] * dt  # ZOH
 
-        ref_window = np.hstack([path(s_k), path(s_k, 1) * v_k[:, None]])
+        ref_window = np.hstack([ref(s_k), ref(s_k, 1) * v_k[:, None]])
 
-        self._current_progress = s0
+        self._current_progress = current_progress
         return ref_window  # (H + 1, 6)
 
-    def _compute_velocity_profile(self, ref: Reference, obs, eps=1e-6, pass_tol=0.2):
+    def _compute_velocity_profile(
+        self, ref: ProgressReference, obs: ObservationDict, eps: float = 1e-6, pass_tol: float = 0.2
+    ) -> NDArray:
 
         # our path is parameterized by arc length
-        s = ref.path.x
+        s = ref.dense_s
         # therefore the second derivative is curvature kappa
-        kappa = la.norm(ref.path(s, 2), axis=-1)
+        kappa = la.norm(ref(s, 2), axis=-1)
 
         # kappa: 1 / R
         # a_lat = v^2 / R
@@ -88,7 +95,7 @@ class MidLevelController:
         v = np.minimum(self.v_max, np.sqrt(np.maximum(self.a_lat_max / kappa, eps)))
 
         # slow down around the first pass of each gate whose true position has not been revealed yet
-        d = la.norm(ref.path(s)[:, None, :] - obs["gates_pos"][None, :, :], axis=-1)  # (N, G)
+        d = la.norm(ref(s)[:, None, :] - obs["gates_pos"][None, :, :], axis=-1)  # (N, G)
         # gate passes are local distance minima within the gate opening
         is_pass = np.zeros_like(d, dtype=bool)
         is_pass[1:-1] = (d[1:-1] <= d[:-2]) & (d[1:-1] < d[2:]) & (d[1:-1] < pass_tol)

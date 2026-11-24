@@ -4,9 +4,19 @@ from pathlib import Path
 import crazyflow
 import numpy as np
 import numpy.linalg as la
+from numpy.typing import NDArray
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control.utils.types import ObservationDict, State
+
+
+def gate_poses_in_sequence(obs: ObservationDict) -> tuple[NDArray, NDArray]:
+    """Extract sequence of gate poses along track from observation dict."""
+    gates_pos = obs["gates_pos"][obs["gate_sequence"]]
+    gates_normals = R.from_quat(obs["gates_quat"][obs["gate_sequence"]]).apply([1.0, 0.0, 0.0])
+    gates_normals *= obs["gate_sequence_direction"][:, None]
+
+    return gates_pos, gates_normals
 
 
 def obs_to_state(obs: ObservationDict) -> State:
@@ -46,7 +56,7 @@ def obstacle_radius() -> float:
 
 
 def dist_to_segment(pts, a, b):
-    """Pointwise distance to the segment described by a->b
+    """Pointwise distance to the segment described by a->b.
 
     pts: (N, 3)
     a: (M, 3)
