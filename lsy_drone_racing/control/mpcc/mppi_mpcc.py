@@ -121,6 +121,10 @@ def crash_mask(
         Crash flags with shape (H + 1,), True from the first crash to the end.
     """
     outside = jnp.any((pos < pos_limits[0]) | (pos > pos_limits[1]), axis=-1)
+    # Once the drone is outside the limits, every rollout would count as crashed from its first
+    # step, all would cost the same, and nothing would steer the drone back. So the limits only
+    # count for rollouts that start inside them.
+    outside = outside & ~outside[0]
     contact = (clearance <= 0) | gate_contact(pos, gates, drone_radius) | outside
     contact = contact.at[0].set(False)
     return jnp.cumsum(contact) > 0
@@ -418,6 +422,10 @@ class MPCCObjective(Protocol):
         """Weights and arrays passed to cost_fn in the current control step."""
         ...
 
+    def max_progress(self, obs: dict[str, NDArray[np.floating]]) -> float:
+        """Upper bound in meters on the progress measured from the drone's position."""
+        ...
+
     def render(self, sim: Sim):
         """Draw the objective's geometry, e.g. a tunnel around the path."""
         ...
@@ -466,6 +474,10 @@ class ContouringObjective:
         """Gate positions, for the higher contour weight near gates, and the weights."""
         return {"gates_pos": jnp.asarray(obs["gates_pos"]), "weights": MPCC_WEIGHTS}
 
+    def max_progress(self, obs: dict[str, NDArray[np.floating]]) -> float:
+        """No bound on the measured progress."""
+        return float("inf")
+
     def render(self, sim: Sim):
         """Nothing to draw beyond the path."""
 
@@ -484,6 +496,8 @@ class MPPIMPCC:
         objective: MPCCObjective | None = None,
         carry_window: tuple[float, float] | None = None,
         gate_margin: float = 0.0,
+        progress_window: tuple[float, float] = PROGRESS_WINDOW,
+        horizon: int = 25,
     ):
         """Initialize the optimizer and compile the update.
 
@@ -499,9 +513,13 @@ class MPPIMPCC:
             gate_margin: Extra radius in meters of the drone in the rollouts' gate contact check.
                 The check uses the drone's collision sphere, while the simulator collides the
                 drone's box, whose corners reach further.
+            progress_window: (behind, ahead) window in meters around the predicted progress in
+                which the drone's progress is measured every step.
+            horizon: Number of planning steps of length 1 / config.env.freq.
         """
         self._dt = 1 / config.env.freq
-        self._horizon = 25  # planning steps, 0.5 s at 50 Hz
+        self._horizon = horizon
+        self._progress_window = progress_window
         self._n_samples = 2048  # sampled sequences per step
         # Noise std per channel: roll, pitch, yaw, thrust
         self._sigma = jnp.array([0.15, 0.15, 0.0, 0.05]) * 2.0
@@ -629,8 +647,9 @@ class MPPIMPCC:
 
         # Measure the progress near the one predicted by the last plan
         theta0 = self._reference.get_progress(
-            obs["pos"], prev_progress=self._theta_pred, search_range_s=PROGRESS_WINDOW
+            obs["pos"], prev_progress=self._theta_pred, search_range_s=self._progress_window
         )
+        theta0 = min(theta0, self._objective.max_progress(obs))
         if theta0 >= self._reference.length:
             self._finished = True
         tangent = np.asarray(path_lookup(self._path, jnp.float32(theta0))[1])

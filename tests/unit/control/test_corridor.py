@@ -13,12 +13,15 @@ from lsy_drone_racing.control.mpcc.corridor import (
     tunnel_half_width_profile,
 )
 from lsy_drone_racing.control.mpcc.cost_pp import (
+    GATE_PASS_MARGIN,
     MPCC_PP_WEIGHTS,
+    CorridorObjective,
     mpcc_pp_cost,
     progress_speed_weight,
 )
 from lsy_drone_racing.control.mpcc.path import ArcLengthPath
 from lsy_drone_racing.control.planner.centerline import CenterlinePlanner
+from lsy_drone_racing.control.planner.reference import Reference
 from lsy_drone_racing.control.utils.utils import drone_collision_radius, obstacle_radius
 
 CONFIG = SimpleNamespace(sim=SimpleNamespace(drone="cf21B_500"))
@@ -76,6 +79,21 @@ def test_centerline_passes_gate_centers_along_signed_normals():
     # The path starts at the drone and runs past the last gate
     np.testing.assert_allclose(reference.path(0.0), obs["pos"], atol=1e-6)
     assert reference.length > planner.gate_progress[-1] + 0.9
+
+
+@pytest.mark.unit
+def test_centerline_turns_around_beside_gate_when_next_gate_is_behind():
+    # Gate 1 lies behind gate 0 (which faces +x), so the centerline turns around behind gate 0
+    obs = track_obs(gate_1_pos=[-1.0, 1.5, 1.0])
+    planner = CenterlinePlanner(obs, CONFIG)
+    reference = planner.plan(obs)
+    s = np.arange(planner.gate_progress[0] + 0.05, planner.gate_progress[1], 0.01)
+    points = reference.path(s)
+    # It gets at least 0.4 m behind gate 0 and does not come back through its frame's outline
+    assert np.max(points[:, 0]) > 1.4
+    back_at_plane = np.abs(points[:, 0] - 1.0) < 0.02
+    in_plane_offset = np.maximum(np.abs(points[:, 1]), np.abs(points[:, 2] - 1.0))
+    assert np.all(in_plane_offset[back_at_plane] > 0.36)
 
 
 @pytest.mark.unit
@@ -267,3 +285,33 @@ def test_progress_speed_weight_rises_near_unrevealed_gates():
         jnp.array([1.0, 0.0, 1.0]), gates, jnp.zeros(2, bool), 1.0, weights
     )
     np.testing.assert_allclose(halfway, 6.0, atol=1e-3)
+
+
+@pytest.mark.unit
+def test_corridor_objective_bounds_progress_at_next_gate():
+    config = SimpleNamespace(
+        sim=SimpleNamespace(drone="cf21B_500"), env=SimpleNamespace(sensor_range=0.7)
+    )
+    planner = SimpleNamespace(gate_progress=np.array([2.0, 5.0]))
+    objective = CorridorObjective(config, planner)
+    assert objective.max_progress({"n_gates_passed": 0}) == pytest.approx(2.0 + GATE_PASS_MARGIN)
+    assert objective.max_progress({"n_gates_passed": 1}) == pytest.approx(5.0 + GATE_PASS_MARGIN)
+    assert objective.max_progress({"n_gates_passed": 2}) == float("inf")
+
+
+@pytest.mark.unit
+def test_centerline_keeps_detour_side_when_rebuilt():
+    def detour_side(reference: Reference, pole_y: float) -> float:
+        """Sign of the centerline's y offset from the pole where it passes it (x = 0)."""
+        points = reference.path(np.arange(0.0, reference.length, 0.005))
+        return float(np.sign(points[np.argmin(np.abs(points[:, 0])), 1] - pole_y))
+
+    # A pole just beside the straight centerline (y = 0), then revealed on its other side, where
+    # the shorter detour would pass the pole on the other side
+    planner = CenterlinePlanner(track_obs(pole_pos=[0.0, 0.05, 1.55]), CONFIG)
+    first_side = detour_side(planner.plan(track_obs(pole_pos=[0.0, 0.05, 1.55])), 0.05)
+    moved = track_obs(pole_pos=[0.0, -0.05, 1.55], pole_visited=True)
+    assert detour_side(planner.plan(moved), -0.05) == first_side
+    # A new planner chooses the other side for the moved pole, so the side above was kept
+    fresh = CenterlinePlanner(moved, CONFIG)
+    assert detour_side(fresh.plan(moved), -0.05) == -first_side

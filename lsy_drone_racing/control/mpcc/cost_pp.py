@@ -69,6 +69,10 @@ TUNNEL_W_NOMINAL = 1.0  # Half-width in meters away from gates
 TUNNEL_D_MID = 0.35
 TUNNEL_STEEPNESS = 0.05
 
+# How far in meters past the next gate's crossing the measured progress may be, since the
+# environment counts a gate as passed only after the step in which the drone crossed it
+GATE_PASS_MARGIN = 0.1
+
 # How far in meters beyond the sensor range around an unrevealed gate the drone already slows down
 SLOW_MARGIN = 0.3
 
@@ -221,6 +225,18 @@ class CorridorObjective:
             "gates_revealed": jnp.asarray(obs["gates_visited"]),
             "slow_radius": self._slow_radius,
         }
+
+    def max_progress(self, obs: dict[str, NDArray[np.floating]]) -> float:
+        """Progress just past the crossing of the next gate that is not passed yet.
+
+        The drone cannot be further along the path before the environment counts the gate as
+        passed. This keeps the measured progress from skipping a gate, e.g. where the path passes
+        close to a later section of itself.
+        """
+        n_passed = int(obs["n_gates_passed"])
+        if n_passed >= len(self._planner.gate_progress):
+            return float("inf")
+        return float(self._planner.gate_progress[n_passed]) + GATE_PASS_MARGIN
 
     def render(self, sim: Sim):
         """Draw the tunnel's four edges."""

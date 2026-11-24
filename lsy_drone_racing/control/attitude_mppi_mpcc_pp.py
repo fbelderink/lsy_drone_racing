@@ -21,6 +21,14 @@ CARRY_WINDOW = (0.5, 1.0)
 # box reach 0.099 m horizontally, beyond its 0.086 m collision sphere. MPCC++ flies close to gate
 # frames, so the difference matters.
 GATE_MARGIN = 0.02
+# Window in meters (behind, ahead) around the predicted progress in which the progress is measured.
+# Far ahead, since the drone may cut a corner of the centerline, e.g. on the other side of a pole,
+# where a narrow window only finds a nearby local minimum of the distance. Jumps past a gate are
+# prevented by `CorridorObjective.max_progress`.
+PROGRESS_WINDOW = (0.2, 1.0)
+# Planning steps, 0.8 s at 50 Hz. With 0.5 s, the narrow tunnel at a gate behind a sharp turn
+# comes into view too late to brake; with 1.0 s, the drone often stalls in front of gates.
+HORIZON = 40
 
 if TYPE_CHECKING:
     import numpy as np
@@ -48,6 +56,8 @@ class AttitudeMPPIMPCCPP(Controller):
             CorridorObjective(config, planner),
             carry_window=CARRY_WINDOW,
             gate_margin=GATE_MARGIN,
+            progress_window=PROGRESS_WINDOW,
+            horizon=HORIZON,
         )
 
     def compute_control(

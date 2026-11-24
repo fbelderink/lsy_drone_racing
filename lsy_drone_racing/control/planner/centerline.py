@@ -15,8 +15,9 @@ import numpy as np
 import numpy.linalg as la
 from scipy.spatial.transform import Rotation as R
 
+from lsy_drone_racing.control.planner.pmm import TURN_EXIT
 from lsy_drone_racing.control.planner.reference import Reference
-from lsy_drone_racing.control.utils.collision import gate_contact
+from lsy_drone_racing.control.utils.collision import GATE_OUTER_HALF_WIDTH, gate_contact
 from lsy_drone_racing.control.utils.utils import drone_collision_radius, obstacle_radius
 
 if TYPE_CHECKING:
@@ -35,8 +36,50 @@ FRAME_MARGIN = 0.1
 # Extra distance in meters by which a detour knot is pushed out, so the spline through it keeps the
 # clearance also next to the knot
 DETOUR_EXTRA = 0.03
+# Clearance in meters between a turnaround knot and the drone touching the gate's outer frame edge
+TURN_CLEARANCE = 0.15
 MAX_DETOURS = 8  # Maximum number of detour knots added in one build
 CHECK_SPACING = 0.01  # Arc-length spacing in meters at which the centerline is checked for poles
+
+
+def turnaround_knot(
+    center: NDArray[np.floating],
+    direction: NDArray[np.floating],
+    next_center: NDArray[np.floating],
+    side_offset: float,
+    poles_pos: NDArray[np.floating],
+    pole_clearance: float,
+) -> tuple[NDArray[np.floating], NDArray[np.floating]]:
+    """Knot behind a gate from which the centerline turns back around the gate's frame.
+
+    Like `pmm.turnaround_waypoint`, it lies TURN_EXIT behind the gate's plane, moved by side_offset
+    to the left, to the right or up, whichever points most towards the next gate, never down to the
+    gate's stand. Sides whose knot would be within pole_clearance of a pole are skipped, unless all
+    are, since a pole often stands right behind a gate.
+
+    Args:
+        center: Gate center with shape (3,).
+        direction: Crossing direction of the gate, a unit vector with shape (3,).
+        next_center: Center of the next gate with shape (3,).
+        side_offset: Distance in meters of the knot from the gate's axis, beyond the frame.
+        poles_pos: Pole positions with shape (n_poles, 3).
+        pole_clearance: Required horizontal distance in meters from a pole's axis.
+
+    Returns:
+        - The knot with shape (3,).
+        - The unit side direction with shape (3,), the centerline's direction at the knot.
+    """
+    horizontal = np.cross(direction, [0.0, 0.0, 1.0])
+    horizontal /= la.norm(horizontal)
+    sides = np.array([[0.0, 0.0, 1.0], horizontal, -horizontal])
+    knots = center + TURN_EXIT * direction + side_offset * sides
+    pole_distance = la.norm(knots[:, None, :2] - poles_pos[None, :, :2], axis=-1)
+    clear = np.all(pole_distance >= pole_clearance, axis=1)
+    preference = sides @ (next_center - center)
+    if np.any(clear):
+        preference = np.where(clear, preference, -np.inf)
+    best = int(np.argmax(preference))
+    return knots[best], sides[best]
 
 
 def centerline_knots(
@@ -44,34 +87,57 @@ def centerline_knots(
     gates_pos: NDArray[np.floating],
     gates_direction: NDArray[np.floating],
     overshoot: float,
-) -> tuple[NDArray[np.floating], NDArray[np.floating]]:
+    turn_side_offset: float,
+    poles_pos: NDArray[np.floating],
+    pole_clearance: float,
+) -> tuple[NDArray[np.floating], NDArray[np.floating], NDArray[np.bool_]]:
     """Knots and unit tangents of the centerline through the gates.
 
     The knots are the start, the gate centers and a point `overshoot` past the last gate, so the
-    planning horizon does not run off the path's end right after the last gate.
+    planning horizon does not run off the path's end right after the last gate. When the next gate
+    lies behind a gate's plane, a turnaround knot behind the gate is added, see `turnaround_knot`.
+    Without it the spline turns around right behind the gate and comes
+    back through the gate's own opening or frame.
 
     Args:
         start: Start position with shape (3,).
         gates_pos: Gate centers in the order they are passed, with shape (n, 3).
         gates_direction: Unit directions in which the gates are passed, with shape (n, 3).
         overshoot: Distance in meters of the last knot past the last gate.
+        turn_side_offset: Distance in meters of a turnaround knot from the gate's axis, to the side
+            or up, beyond the frame.
+        poles_pos: Pole positions with shape (n_poles, 3).
+        pole_clearance: Required horizontal distance in meters of a turnaround knot from a pole.
 
     Returns:
-        - The knots with shape (n + 2, 3).
-        - The unit tangents with shape (n + 2, 3): towards the first gate at the start, then the
-          gates' directions.
+        - The knots with shape (m, 3).
+        - The unit tangents with shape (m, 3): towards the first gate at the start, then the gates'
+          directions, and at a turnaround knot the side it moves to.
+        - Whether each knot is a gate center, with shape (m,).
     """
     to_first_gate = gates_pos[0] - start
-    knots = np.vstack((start, gates_pos, gates_pos[-1] + overshoot * gates_direction[-1]))
-    tangents = np.vstack(
-        (to_first_gate / la.norm(to_first_gate), gates_direction, gates_direction[-1])
-    )
-    return knots, tangents
+    knots, tangents, is_gate = [start], [to_first_gate / la.norm(to_first_gate)], [False]
+    for i, (center, direction) in enumerate(zip(gates_pos, gates_direction)):
+        knots.append(center)
+        tangents.append(direction)
+        is_gate.append(True)
+        is_last = i + 1 == len(gates_pos)
+        if not is_last and np.dot(gates_pos[i + 1] - center, direction) < 0:
+            turn, side = turnaround_knot(
+                center, direction, gates_pos[i + 1], turn_side_offset, poles_pos, pole_clearance
+            )
+            knots.append(turn)
+            tangents.append(side)
+            is_gate.append(False)
+    knots.append(gates_pos[-1] + overshoot * gates_direction[-1])
+    tangents.append(gates_direction[-1])
+    is_gate.append(False)
+    return np.array(knots), np.array(tangents), np.array(is_gate)
 
 
 def closest_pole_conflict(
     reference: Reference, poles_pos: NDArray[np.floating], clearance: float
-) -> tuple[float, NDArray[np.floating]] | None:
+) -> tuple[float, int, NDArray[np.floating]] | None:
     """Find the deepest point where the centerline comes closer to a pole than the clearance.
 
     Poles are vertical, so only the horizontal distance counts.
@@ -83,7 +149,8 @@ def closest_pole_conflict(
 
     Returns:
         None if the centerline keeps the clearance everywhere. Otherwise the arc length in meters of
-        the deepest point, and two candidate detour knots with shape (2, 3): that point pushed
+        the deepest point, the index of the pole, and two candidate detour knots with shape (2, 3):
+        that point pushed
         horizontally and perpendicular to the path to the clearance plus DETOUR_EXTRA from the pole,
         first on the side of the pole the path is already on, then on the other side.
     """
@@ -107,7 +174,7 @@ def closest_pole_conflict(
         knot[:2] = (
             poles_pos[pole, :2] + along * tangent + knot_side * (clearance + DETOUR_EXTRA) * left
         )
-    return float(s[i]), knots
+    return float(s[i]), int(pole), knots
 
 
 def gate_frame_proximity(reference: Reference, gates: NDArray[np.floating], radius: float) -> float:
@@ -151,6 +218,11 @@ class CenterlinePlanner:
         self._pole_clearance = drone_collision_radius(config.sim.drone) + obstacle_radius()
         self._pole_clearance += POLE_MARGIN
         self._frame_radius = drone_collision_radius(config.sim.drone) + FRAME_MARGIN
+        self._turn_side_offset = (
+            GATE_OUTER_HALF_WIDTH + drone_collision_radius(config.sim.drone) + TURN_CLEARANCE
+        )
+        # Horizontal unit direction from each pole to its detour, kept across rebuilds
+        self._detour_sides: dict[int, NDArray[np.floating]] = {}
         self._reference = None
         self.gate_progress = None  # Arc length of every gate crossing in meters, shape (n,)
         self._build(obs)
@@ -177,31 +249,44 @@ class CenterlinePlanner:
         gates_pos = np.asarray(obs["gates_pos"])[self._gate_sequence]
         normals = R.from_quat(np.asarray(obs["gates_quat"])[self._gate_sequence]).apply([1, 0, 0])
         directions = normals * self._gate_sequence_direction[:, None]
-        knots, tangents = centerline_knots(self._start, gates_pos, directions, OVERSHOOT)
-        is_gate = np.zeros(len(knots), dtype=bool)
-        is_gate[1:-1] = True
-
         poles_pos = np.asarray(obs["obstacles_pos"])
+        knots, tangents, is_gate = centerline_knots(
+            self._start,
+            gates_pos,
+            directions,
+            OVERSHOOT,
+            self._turn_side_offset,
+            poles_pos,
+            self._pole_clearance + DETOUR_EXTRA,
+        )
+
         all_normals = R.from_quat(np.asarray(obs["gates_quat"])).apply([1, 0, 0])
         gates = np.hstack((np.asarray(obs["gates_pos"]), all_normals))
         reference = Reference(knots, tangents, np.zeros_like(tangents))
         conflict = closest_pole_conflict(reference, poles_pos, self._pole_clearance)
         n_detours = 0
         while conflict is not None and n_detours < MAX_DETOURS:
-            s, candidates = conflict
+            s, pole, candidates = conflict
             # Insert the detour knot between the knots around it, keeping the local direction
             index = int(np.searchsorted(reference.sparse_s, s))
             tangent = reference.path(s, 1)
             tangents = np.insert(tangents, index, tangent / la.norm(tangent), axis=0)
             is_gate = np.insert(is_gate, index, False)
+            if pole in self._detour_sides:
+                # Keep the side chosen in an earlier build, so the centerline does not switch to the
+                # pole's other side while the drone is flying past it
+                away = candidates[:, :2] - poles_pos[pole, :2]
+                candidates = candidates[[int(np.argmax(away @ self._detour_sides[pole]))]]
             options = []
             for knot in candidates:
                 option_knots = np.insert(knots, index, knot, axis=0)
                 option = Reference(option_knots, tangents, np.zeros_like(tangents))
                 proximity = gate_frame_proximity(option, gates, self._frame_radius)
-                options.append((proximity, option.length, option_knots, option))
+                options.append((proximity, option.length, option_knots, option, knot))
             # Least of the centerline near a gate frame, then the shortest
-            _, _, knots, reference = min(options, key=lambda option: option[:2])
+            _, _, knots, reference, knot = min(options, key=lambda option: option[:2])
+            side = knot[:2] - poles_pos[pole, :2]
+            self._detour_sides.setdefault(pole, side / la.norm(side))
             conflict = closest_pole_conflict(reference, poles_pos, self._pole_clearance)
             n_detours += 1
         if conflict is not None:

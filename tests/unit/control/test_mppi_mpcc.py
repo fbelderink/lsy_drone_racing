@@ -126,6 +126,15 @@ def test_crash_mask_never_flags_initial_state():
 
 
 @pytest.mark.unit
+def test_crash_mask_ignores_limits_when_starting_outside():
+    far = jnp.array([[10.0, 10.0, 1.5]])
+    # Starts outside the y limit of 3 m and flies back in: no crash
+    back_inside = line([2.0, 3.5, 1.0], [2.0, 2.5, 1.0])
+    clearance = obstacle_clearance(back_inside, far, jnp.zeros(1), radius=0.1)
+    assert not jnp.any(crash_mask(back_inside, clearance, GATES, LIMITS, DRONE_RADIUS))
+
+
+@pytest.mark.unit
 def test_freeze_after_crash_holds_first_crashed_state():
     X = jnp.arange(5 * 12, dtype=jnp.float32).reshape(5, 12)
     crashed = jnp.array([False, False, True, True, True])
