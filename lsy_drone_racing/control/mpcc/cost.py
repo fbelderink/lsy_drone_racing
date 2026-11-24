@@ -13,7 +13,7 @@ by the virtual input dv_theta (Eq. 16).
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax.numpy as jnp
 
@@ -38,6 +38,17 @@ MPCC_WEIGHTS = {
     "r_dv_theta": 0.01,  # Weight for changes of the progress speed
     "mu": 40.0,  # Reward for progress speed
 }
+
+
+class ProgressLimits(NamedTuple):
+    """Hard limits on the progress states. A limit of inf disables it."""
+
+    v_max: float  # Maximum progress speed in m/s
+    dv_max: float  # Maximum magnitude of a sampled progress acceleration in m/s^2
+    # Maximum progress speed in m/s where the path is near a gate whose pose is not revealed yet
+    v_slow: float
+    # How much faster in m/s than the drone's own speed along the path the progress may start a step
+    slack: float
 
 
 def contouring_errors(pos: Array, path_pos: Array, tangent: Array) -> tuple[Array, Array]:

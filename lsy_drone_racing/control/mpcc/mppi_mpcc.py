@@ -1,7 +1,9 @@
 """Sampling-based MPC (MPPI) with the contouring cost (MPCC) of `mpcc/cost.py`.
 
 The path to follow comes from any planner implementing `planner/interface.py`, so this module
-does not depend on how the path is generated.
+does not depend on how the path is generated. The cost and the limits of the progress states come
+from an objective (`MPCCObjective`): `ContouringObjective` here for the cost of `mpcc/cost.py`, and
+`mpcc/cost_pp.CorridorObjective` for MPCC++.
 
 Instead of tracking a time-indexed reference, the controller samples a virtual progress
 acceleration dv_theta next to the commands, so it chooses itself how fast to move along the planned
@@ -17,7 +19,7 @@ conventions:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -33,7 +35,12 @@ from lsy_drone_racing.control.attitude_mppi import (
     rollout,
     speed_to_rgba,
 )
-from lsy_drone_racing.control.mpcc.cost import MPCC_WEIGHTS, mpcc_cost, progress_step
+from lsy_drone_racing.control.mpcc.cost import (
+    MPCC_WEIGHTS,
+    ProgressLimits,
+    mpcc_cost,
+    progress_step,
+)
 from lsy_drone_racing.control.mpcc.path import (
     carry_progress,
     path_from_reference,
@@ -159,11 +166,12 @@ def progress_rollout(
     gates: Array,
     gates_revealed: Array,
     dt: float,
+    limits: ProgressLimits,
 ) -> tuple[Array, Array, Array]:
     """Simulate the progress states for a sequence of progress accelerations.
 
-    The progress speed is capped at V_THETA_SLOW where the path is near an unrevealed gate, and at
-    V_THETA_MAX elsewhere, and everywhere by the path's speed profile.
+    The progress speed is capped at limits.v_slow where the path is near an unrevealed gate, and at
+    limits.v_max elsewhere, and everywhere by the path's speed profile.
 
     Args:
         theta0: Initial progress in meters.
@@ -174,6 +182,7 @@ def progress_rollout(
         gates: Position and normal vector of every gate with shape (n_gates, 6).
         gates_revealed: Whether each gate's true pose is known, with shape (n_gates,).
         dt: Integration step in seconds.
+        limits: Limits of the progress states.
 
     Returns:
         - Progress with shape (H + 1,), including theta0.
@@ -185,7 +194,7 @@ def progress_rollout(
         path_xy = path_lookup(path, carry[0])[0][:2]
         gate_xy_distance = jnp.linalg.norm(gates[:, :2] - path_xy, axis=-1)
         near_unrevealed = jnp.any((gate_xy_distance < SLOW_RADIUS) & ~gates_revealed)
-        v_theta_max = jnp.where(near_unrevealed, V_THETA_SLOW, V_THETA_MAX)
+        v_theta_max = jnp.where(near_unrevealed, limits.v_slow, limits.v_max)
         v_theta_max = jnp.minimum(v_theta_max, profile_lookup(speed_limit, path.length, carry[0]))
         theta_next, v_theta_next = progress_step(*carry, dv, dt, path.length, v_theta_max)
         return (theta_next, v_theta_next), (theta_next, v_theta_next)
@@ -217,7 +226,9 @@ def mppi_mpcc_update(
     pos_limits: Array,
     drone_radius: Array,
     obstacle_radius: Array,
-    weights: dict,
+    cost_fn: CostFunction,
+    cost_inputs: dict,
+    limits: ProgressLimits,
     params: dict,
     dt: float,
     disc: dict,
@@ -250,7 +261,9 @@ def mppi_mpcc_update(
         pos_limits: Lower and upper position limits with shape (2, 3).
         drone_radius: Collision radius of the drone in meters.
         obstacle_radius: Collision radius of the obstacle poles in meters.
-        weights: MPCC cost weights, see `MPCC_WEIGHTS`.
+        cost_fn: Path-following cost of one rollout, see `CostFunction`.
+        cost_inputs: Weights and arrays passed on to cost_fn.
+        limits: Limits of the progress states.
         params: Drone parameters of the `so_rpy_rotor_drag` model.
         dt: Integration step in seconds.
         disc: Discretization of the H steps of length dt, see `attitude_mppi.discretize`.
@@ -283,7 +296,7 @@ def mppi_mpcc_update(
     sampled_dv_theta = dv_theta_nom + sigma_dv_theta * jax.random.normal(
         key_dv, (n_samples, horizon)
     )
-    sampled_dv_theta = jnp.clip(sampled_dv_theta, -DV_THETA_MAX, DV_THETA_MAX)
+    sampled_dv_theta = jnp.clip(sampled_dv_theta, -limits.dv_max, limits.dv_max)
 
     dts = jnp.full(horizon, dt)
 
@@ -292,10 +305,10 @@ def mppi_mpcc_update(
 
     rollouts = jax.vmap(simulate)(sampled_actions)
     theta, v_theta, dv_theta = jax.vmap(
-        progress_rollout, in_axes=(None, None, 0, None, None, None, None, None)
-    )(theta0, v_theta0, sampled_dv_theta, path, speed_limit, gates, gates_revealed, dt)
+        progress_rollout, in_axes=(None, None, 0, None, None, None, None, None, None)
+    )(theta0, v_theta0, sampled_dv_theta, path, speed_limit, gates, gates_revealed, dt, limits)
 
-    def cost_fn(X: Array, U: Array, theta: Array, v_theta: Array, dv_theta: Array) -> Array:
+    def rollout_cost(X: Array, U: Array, theta: Array, v_theta: Array, dv_theta: Array) -> Array:
         radius = drone_radius + obstacle_radius
         clearance = obstacle_clearance(X[:, :3], obstacles_pos, obstacles_inflation, radius)
         crashed = crash_mask(
@@ -304,12 +317,10 @@ def mppi_mpcc_update(
         # A crashed rollout stays where it crashed and earns no progress from then on
         X = freeze_after_crash(X, crashed)
         clearance = obstacle_clearance(X[:, :3], obstacles_pos, obstacles_inflation, radius)
-        contouring = mpcc_cost(
-            X, U, u_prev, theta, v_theta * ~crashed, dv_theta, path, gates[:, :3], weights
-        )
+        contouring = cost_fn(X, U, u_prev, theta, v_theta * ~crashed, dv_theta, path, cost_inputs)
         return contouring + collision_cost(clearance, crashed, COLLISION_WEIGHTS)
 
-    costs = jax.vmap(cost_fn)(rollouts, sampled_actions, theta, v_theta, dv_theta)
+    costs = jax.vmap(rollout_cost)(rollouts, sampled_actions, theta, v_theta, dv_theta)
 
     lam = adaptive_lambda(costs, target_ess)
     sample_weights = jax.nn.softmax(-costs / lam)
@@ -319,7 +330,7 @@ def mppi_mpcc_update(
     # Average the effective accelerations, so the plan matches what the progress states did
     dv_theta_new = jnp.sum(sample_weights[:, None] * dv_theta, axis=0)
     theta_plan, v_theta_plan, _ = progress_rollout(
-        theta0, v_theta0, dv_theta_new, path, speed_limit, gates, gates_revealed, dt
+        theta0, v_theta0, dv_theta_new, path, speed_limit, gates, gates_revealed, dt, limits
     )
 
     best = jax.lax.top_k(-costs, N_VIS_BEST)[1]
@@ -346,19 +357,133 @@ def path_speed_profile(path: ArcLengthPath) -> Array:
     return speed_profile(path, A_LAT_MAX, A_BRAKE, V_THETA_MAX, CURVATURE_DS)
 
 
+class CostFunction(Protocol):
+    """Path-following cost of a single rollout, without the collision cost."""
+
+    def __call__(
+        self,
+        X: Array,
+        U: Array,
+        u_prev: Array,
+        theta: Array,
+        v_theta: Array,
+        dv_theta: Array,
+        path: ArcLengthPath,
+        cost_inputs: dict,
+    ) -> Array:
+        """Compute the cost.
+
+        Args:
+            X: State trajectory with shape (H + 1, 13).
+            U: Control sequence with shape (H, 4).
+            u_prev: Previous control input with shape (4,).
+            theta: Progress trajectory with shape (H + 1,).
+            v_theta: Progress speed trajectory with shape (H + 1,), zero after a crash.
+            dv_theta: Progress acceleration sequence with shape (H,).
+            path: The path to follow.
+            cost_inputs: Weights and arrays of the objective, see `MPCCObjective.cost_inputs`.
+
+        Returns:
+            The scalar cost.
+        """
+        ...
+
+
+class MPCCObjective(Protocol):
+    """Cost and progress limits that `MPPIMPCC` optimizes.
+
+    An objective may precompute arrays for every new path, which it then passes to its cost.
+    """
+
+    limits: ProgressLimits
+    # Progress speed limit in m/s on the current path's grid, see `mpcc/path.speed_profile`
+    speed_limit: Array
+
+    @staticmethod
+    def cost_fn(*args: Array) -> Array:
+        """The cost of a single rollout, see `CostFunction`. Must be a static method."""
+        ...
+
+    def on_new_path(self, path: ArcLengthPath):
+        """Precompute the arrays that depend on the path, called on the first path and replans."""
+        ...
+
+    def cost_inputs(self, obs: dict[str, NDArray[np.floating]]) -> dict:
+        """Weights and arrays passed to cost_fn in the current control step."""
+        ...
+
+    def render(self, sim: Sim):
+        """Draw the objective's geometry, e.g. a tunnel around the path."""
+        ...
+
+
+class ContouringObjective:
+    """The MPCC cost of `mpcc/cost.py` with the progress limits and speed profile of this module."""
+
+    limits = ProgressLimits(
+        v_max=V_THETA_MAX, dv_max=DV_THETA_MAX, v_slow=V_THETA_SLOW, slack=V_THETA_SLACK
+    )
+
+    def __init__(self):
+        """Initialize the objective without a path."""
+        self.speed_limit = None
+
+    @staticmethod
+    def cost_fn(
+        X: Array,
+        U: Array,
+        u_prev: Array,
+        theta: Array,
+        v_theta: Array,
+        dv_theta: Array,
+        path: ArcLengthPath,
+        cost_inputs: dict,
+    ) -> Array:
+        """`mpcc_cost` with the gate positions and weights taken from cost_inputs."""
+        return mpcc_cost(
+            X,
+            U,
+            u_prev,
+            theta,
+            v_theta,
+            dv_theta,
+            path,
+            cost_inputs["gates_pos"],
+            cost_inputs["weights"],
+        )
+
+    def on_new_path(self, path: ArcLengthPath):
+        """Compute the path's speed profile."""
+        self.speed_limit = path_speed_profile(path)
+
+    def cost_inputs(self, obs: dict[str, NDArray[np.floating]]) -> dict:
+        """Gate positions, for the higher contour weight near gates, and the weights."""
+        return {"gates_pos": jnp.asarray(obs["gates_pos"]), "weights": MPCC_WEIGHTS}
+
+    def render(self, sim: Sim):
+        """Nothing to draw beyond the path."""
+
+
 class MPPIMPCC:
     """MPPI on the contouring cost using the collective thrust and attitude interface.
 
     Holds the optimizer state between control steps. Controllers wrap it with their planner.
     """
 
-    def __init__(self, obs: dict[str, NDArray[np.floating]], config: dict, planner: PathPlanner):
+    def __init__(
+        self,
+        obs: dict[str, NDArray[np.floating]],
+        config: dict,
+        planner: PathPlanner,
+        objective: MPCCObjective | None = None,
+    ):
         """Initialize the optimizer and compile the update.
 
         Args:
             obs: The initial observation of the environment's state.
             config: The race configuration.
             planner: Planner of the path to follow.
+            objective: Cost and progress limits to optimize, `ContouringObjective` if None.
         """
         self._dt = 1 / config.env.freq
         self._horizon = 25  # planning steps, 0.5 s at 50 Hz
@@ -385,12 +510,13 @@ class MPPIMPCC:
         self._obstacle_uncertainty = obstacle_position_uncertainty(config)
 
         self._planner = planner
+        self._objective = ContouringObjective() if objective is None else objective
         self._reference = self._planner.plan(obs)
         self._path = path_from_reference(self._reference)
-        self._speed_limit = path_speed_profile(self._path)
+        self._objective.on_new_path(self._path)
         self._path_version = self._reference._version
 
-        self._update = jax.jit(mppi_mpcc_update, static_argnames=("n_samples",))
+        self._update = jax.jit(mppi_mpcc_update, static_argnames=("n_samples", "cost_fn"))
         self._key = jax.random.key(0)
         # Warm start: hold hover thrust with level attitude, at zero progress speed
         self._U_nom = jnp.tile(jnp.array([0.0, 0.0, 0.0, self._hover_thrust]), (self._horizon, 1))
@@ -426,7 +552,7 @@ class MPPIMPCC:
             self._dv_theta_nom,
             self._u_prev,
             self._path,
-            self._speed_limit,
+            self._objective.speed_limit,
             jnp.asarray(np.hstack((obs["gates_pos"], gates_normal))),
             jnp.asarray(obs["gates_visited"]),
             jnp.asarray(obs["obstacles_pos"]),
@@ -437,7 +563,9 @@ class MPPIMPCC:
             self._pos_limits,
             self._drone_radius,
             self._obstacle_radius,
-            MPCC_WEIGHTS,
+            self._objective.cost_fn,
+            self._objective.cost_inputs(obs),
+            self._objective.limits,
             self._params,
             self._dt,
             self._disc,
@@ -457,11 +585,12 @@ class MPPIMPCC:
             # The path starts at the drone, moving along its first tangent
             self._theta_pred = 0.0
             speed_along_path = float(np.dot(obs["vel"], np.asarray(new_path.tangents[0])))
-            self._v_theta_pred = float(np.clip(speed_along_path, 0.0, V_THETA_MAX))
+            v_theta_max = self._objective.limits.v_max
+            self._v_theta_pred = float(np.clip(speed_along_path, 0.0, v_theta_max))
         else:
             self._theta_pred = carry_progress(self._path, self._theta_pred, self._reference)
         self._path = new_path
-        self._speed_limit = path_speed_profile(new_path)
+        self._objective.on_new_path(new_path)
         self._path_version = self._reference._version
 
     def compute_control(self, obs: dict[str, NDArray[np.floating]]) -> NDArray[np.floating]:
@@ -486,7 +615,9 @@ class MPPIMPCC:
             self._finished = True
         tangent = np.asarray(path_lookup(self._path, jnp.float32(theta0))[1])
         speed_along_path = max(float(np.dot(obs["vel"], tangent)), 0.0)
-        self._v_theta_pred = min(self._v_theta_pred, speed_along_path + V_THETA_SLACK)
+        self._v_theta_pred = min(
+            self._v_theta_pred, speed_along_path + self._objective.limits.slack
+        )
 
         self._key, subkey = jax.random.split(self._key)
         (
@@ -539,6 +670,7 @@ class MPPIMPCC:
         # already use most of them.
         whole_path = np.asarray(self._path.positions)[::40]
         draw_line(sim, whole_path, rgba=(1.0, 1.0, 1.0, 0.4), start_size=1.5, end_size=1.5)
+        self._objective.render(sim)
 
         # Part of the path covered by the plan, colored by the planned progress speed
         colors = speed_to_rgba(v_theta_plan[:-1])

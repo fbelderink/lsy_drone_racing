@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -7,16 +10,16 @@ import pytest
 from crazyflow.dynamics import Dynamics, load_params
 
 from lsy_drone_racing.control.attitude_mppi import discretize
-from lsy_drone_racing.control.mpcc.cost import MPCC_WEIGHTS
+from lsy_drone_racing.control.mpcc.cost_pp import CorridorObjective
 from lsy_drone_racing.control.mpcc.mppi_mpcc import (
     COLLISION_WEIGHTS,
     MPPIMPCC,
     V_THETA_MAX,
+    ContouringObjective,
     collision_cost,
     crash_mask,
     freeze_after_crash,
     mppi_mpcc_update,
-    path_speed_profile,
 )
 from lsy_drone_racing.control.mpcc.path import path_from_reference
 from lsy_drone_racing.control.planner.pmm import DensePathReference
@@ -25,6 +28,11 @@ from lsy_drone_racing.control.utils.collision import (
     obstacle_clearance,
     obstacle_position_uncertainty,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from lsy_drone_racing.control.mpcc.path import ArcLengthPath
 
 DRONE_RADIUS = 0.086
 # Gate at the origin, 1 m up, facing +x
@@ -154,6 +162,7 @@ def controller_after_replan(starts_at_drone: bool, vel: list[float]) -> MPPIMPCC
     new = DensePathReference(np.array([[1.0, 0.0, 1.0], [5.0, 0.0, 1.0]]), version=2)
     mpcc = MPPIMPCC.__new__(MPPIMPCC)
     mpcc._planner = SimpleNamespace(starts_at_drone=starts_at_drone)
+    mpcc._objective = ContouringObjective()
     mpcc._path = path_from_reference(old)
     mpcc._theta_pred = 1.5
     mpcc._v_theta_pred = 0.7
@@ -181,8 +190,24 @@ def test_replace_path_projects_progress_otherwise():
     assert mpcc._v_theta_pred == 0.7
 
 
+def contouring_objective(path: ArcLengthPath) -> ContouringObjective:
+    """MPCC objective on the given path."""
+    objective = ContouringObjective()
+    objective.on_new_path(path)
+    return objective
+
+
+def corridor_objective(path: ArcLengthPath) -> CorridorObjective:
+    """MPCC++ objective on the given path, with a gate crossing 2 m along it."""
+    planner = SimpleNamespace(gate_progress=np.array([2.0]))
+    objective = CorridorObjective(SimpleNamespace(sim=SimpleNamespace(drone="cf21B_500")), planner)
+    objective.on_new_path(path)
+    return objective
+
+
 @pytest.mark.unit
-def test_mppi_mpcc_update_runs_with_rollout_model():
+@pytest.mark.parametrize("make_objective", [contouring_objective, corridor_objective])
+def test_mppi_mpcc_update_runs_with_rollout_model(make_objective: Callable):
     horizon, n_samples, dt = 5, 32, 0.02
     params = load_params(Dynamics.so_rpy_rotor_drag, "cf21B_500")
     hover_thrust = (params["mass"] * -params["gravity_vec"][-1] - params["acc_coef"]) / params[
@@ -194,6 +219,7 @@ def test_mppi_mpcc_update_runs_with_rollout_model():
     # Hovering at the start of the path, with the thrust state at hover thrust
     x0 = jnp.zeros(13).at[:3].set(jnp.array([-2.0, 0.0, 1.0])).at[12].set(hover_thrust)
     U_nom = jnp.tile(jnp.array([0.0, 0.0, 0.0, hover_thrust]), (horizon, 1))
+    objective = make_objective(path)
 
     out = mppi_mpcc_update(
         key=jax.random.key(0),
@@ -204,7 +230,7 @@ def test_mppi_mpcc_update_runs_with_rollout_model():
         dv_theta_nom=jnp.zeros(horizon),
         u_prev=U_nom[0],
         path=path,
-        speed_limit=path_speed_profile(path),
+        speed_limit=objective.speed_limit,
         gates=GATES,
         gates_revealed=jnp.array([True]),
         obstacles_pos=jnp.array([[0.0, 2.0, 1.5]]),
@@ -212,7 +238,9 @@ def test_mppi_mpcc_update_runs_with_rollout_model():
         pos_limits=LIMITS,
         drone_radius=DRONE_RADIUS,
         obstacle_radius=0.015,
-        weights=MPCC_WEIGHTS,
+        cost_fn=objective.cost_fn,
+        cost_inputs=objective.cost_inputs({"gates_pos": np.asarray(GATES[:, :3])}),
+        limits=objective.limits,
         params=params,
         dt=dt,
         disc=discretize(params, np.full(horizon, dt)),
