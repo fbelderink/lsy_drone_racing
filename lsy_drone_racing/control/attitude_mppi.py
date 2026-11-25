@@ -27,7 +27,7 @@ from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
-from lsy_drone_racing.control.mid_level.mid_level_controller import MidLevelController
+from lsy_drone_racing.control.mid_level.curvature_mlc import CurvatureMidLevelController
 from lsy_drone_racing.control.planner.high_level_planner import SplinePlanner
 
 if TYPE_CHECKING:
@@ -593,7 +593,7 @@ class AttitudeMPPI(Controller):
             / self._params["cmd_f_coef"]
         )
 
-        self._mlc = MidLevelController(
+        self._mlc = CurvatureMidLevelController(
             SplinePlanner(obs, config),
             v_max=mlc["v_max"],
             a_long_max=mlc["a_long_max"],
@@ -603,6 +603,21 @@ class AttitudeMPPI(Controller):
             gate_window=mlc["gate_window"],
             gate_plateau=mlc["gate_plateau"],
         )
+
+        """
+        self._mlc = TOPPRAMidLevelController(
+            SplinePlanner(obs, config),
+            config,
+            v_max=mlc["v_max"],
+            a_long_max=mlc["a_long_max"],
+            v_gate_max=mlc["v_gate_max"],
+            gate_window=mlc["gate_window"],
+            gate_plateau=mlc["gate_plateau"],
+            thrust_ratio=0.8,
+            tilt_max=1.0,
+            grid_ds=0.01,
+        )
+        """
 
         # Disturbance estimate and the one-step prediction it is updated from
         self._dist_alpha = float(p["dist_alpha"])
@@ -684,7 +699,7 @@ class AttitudeMPPI(Controller):
         Returns:
             The command [roll, pitch, yaw, thrust] as a numpy array.
         """
-        if self._mlc._current_progress >= self._mlc._planner._current_reference.length:
+        if self._mlc.progress >= self._mlc.reference.length:
             self._finished = True
 
         self._ref = self._reference(obs)
@@ -757,23 +772,23 @@ class AttitudeMPPI(Controller):
             return
 
         # Reference path from high level planner
-        _, ref_path = self._mlc._planner._current_reference.sample(num_samples=200)
+        _, ref_path = self._mlc.reference.sample(num_samples=200)
         draw_line(sim, ref_path, rgba=(0.0, 1.0, 0.0, 1.0))
 
-        """
         # Local reference trajectory handed to MPPI, colored by its speed
         ref_pos = self._ref[:, :3]
         colors = speed_to_rgba(np.linalg.norm(self._ref[:, 3:6], axis=1)[:-1])
         for i in range(len(ref_pos) - 1):
             draw_line(sim, ref_pos[i : i + 2], rgba=colors[i], start_size=3.0, end_size=3.0)
 
+        # Reference point the drone should be tracking right now
+        draw_points(sim, ref_pos[:1], rgba=(1.0, 0.9, 0.0, 1.0), size=0.03)
+        """
         self._draw_gate_perception(sim)
         self._draw_obstacle_perception(sim)
 
         if self._vis is None:
             return
-        # Reference point the drone should be tracking right now
-        draw_points(sim, ref_pos[:1], rgba=(1.0, 0.9, 0.0, 1.0), size=0.03)
 
         vis_pos, vis_weights, mean_path = self._vis
         # Rollout tree: opaque, thick and bright for high weight, faint and thin for low weight
