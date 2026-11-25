@@ -721,10 +721,13 @@ class MPPIMPCC:
         # Rollout tree: opaque, thick and bright for high weight, faint and thin for low weight
         # (sqrt compresses the weights, which span orders of magnitude)
         w = np.sqrt(vis_weights / vis_weights.max())
+        # Every 2nd step up to a horizon of 25, sparser beyond, so the rollouts stay within about
+        # 520 of the viewer's 1000 geoms
+        stride = max(2, self._horizon // 12)
         for pos, wi in zip(vis_pos, w):
             draw_line(
                 sim,
-                pos[::2],
+                pos[::stride],
                 rgba=(0.1, 1.0, 0.1, 0.1 + 0.9 * wi),
                 start_size=1.0 + 3.0 * wi,
                 end_size=1.0 + 3.0 * wi,
