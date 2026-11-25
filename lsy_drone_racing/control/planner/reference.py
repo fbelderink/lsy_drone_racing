@@ -21,13 +21,45 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 
-def quintic_hermite(u: NDArray, p: NDArray, v: NDArray, a: NDArray) -> BPoly:
+def quintic_hermite_scipy(u: NDArray, p: NDArray, v: NDArray, a: NDArray) -> BPoly:
     """Create a quintic hermite spline parameterized in chord lengths u."""
     if np.any(np.diff(u) <= 0):
         raise ValueError("Consecutive knots must not coincide.")
 
     curve = BPoly.from_derivatives(u, np.stack([p, v, a], axis=1))  # (K, 3 derivs, 3 dims)
     return curve
+
+
+def quintic_hermite(u: NDArray, p: NDArray, v: NDArray, a: NDArray) -> BPoly:
+    """Create a quintic hermite spline parameterized in chord lengths u.
+
+    Same spline as quintic_hermite_scipy, but the Bernstein coefficients of all segments are
+    computed at once in closed form instead of in BPoly.from_derivatives' loop over segments.
+    On the local coordinate t = (u - u_k) / h_k of a segment, the derivatives at its ends fix the
+    outer three coefficients on each side.
+
+    Args:
+        u: (K,) strictly increasing knots.
+        p: (K, dim) positions at the knots.
+        v: (K, dim) first derivatives w.r.t. u at the knots.
+        a: (K, dim) second derivatives w.r.t. u at the knots.
+    """
+    if np.any(np.diff(u) <= 0):
+        raise ValueError("Consecutive knots must not coincide.")
+
+    h = np.diff(u)[:, None]  # (K-1, 1) segment lengths
+    p0, p1, v0, v1, a0, a1 = p[:-1], p[1:], v[:-1], v[1:], a[:-1], a[1:]
+    coeffs = np.stack(  # (6, K-1, dim) Bernstein coefficients per segment
+        [
+            p0,
+            p0 + h / 5 * v0,
+            p0 + 2 * h / 5 * v0 + h**2 / 20 * a0,
+            p1 - 2 * h / 5 * v1 + h**2 / 20 * a1,
+            p1 - h / 5 * v1,
+            p1,
+        ]
+    )
+    return BPoly(coeffs, u)
 
 
 def arclen_derivs(dp_du: NDArray, d2p_du2: NDArray) -> tuple[NDArray, NDArray]:
