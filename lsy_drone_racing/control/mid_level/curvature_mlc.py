@@ -10,7 +10,7 @@ from numpy.typing import NDArray
 from lsy_drone_racing.control.mid_level.mlc import MidLevelController
 from lsy_drone_racing.control.planner.high_level_planner import SplinePlanner
 from lsy_drone_racing.control.planner.reference import ProgressReference
-from lsy_drone_racing.control.utils.types import ObservationDict, Trajectory
+from lsy_drone_racing.control.utils.types import ObservationDict
 
 
 class CurvatureMidLevelController(MidLevelController):
@@ -46,65 +46,24 @@ class CurvatureMidLevelController(MidLevelController):
             gate_plateau: Progress in meters around a gate over which the gate cap stays flat, so
                 it holds until the gate is revealed.
         """
-        self._planner = planner
-
+        super().__init__(planner, a_long_max)
         self.v_max = v_max
-        self.a_long_max = a_long_max
         self.a_lat_max = a_lat_max
         self.a_brake_max = a_brake_max
         self.v_gate_max = v_max if v_gate_max is None else v_gate_max
         self.gate_window = gate_window
         self.gate_plateau = gate_plateau
 
-        self._reference: ProgressReference | None = None
         self._grid: NDArray | None = None
         self._profile: NDArray | None = None
-        self._progress: float = 0.0
-
-    @property
-    def reference(self) -> ProgressReference:
-        """The reference path the trajectory follows."""
-        return self._reference
-
-    @property
-    def progress(self) -> float:
-        """The drone's progress s in meters on the reference path."""
-        return self._progress
 
     def speed_limit(self, s: NDArray) -> NDArray:
         """Speed of the velocity profile at progress s."""
         return np.interp(s, self._grid, self._profile)
 
-    def get_trajectory(self, obs: ObservationDict, horizon: int, dt: float) -> Trajectory:
-        """Compute trajectory of horizon H for current reference path."""
-        ref, updated = self._planner.plan(obs)
-
-        if updated or self._reference is None:
-            self._reference = ref
-            self._grid, self._profile = self._compute_velocity_profile(ref, obs)
-
-        s_k = np.zeros((horizon + 1,))
-        v_k = np.zeros((horizon + 1,))
-
-        current_speed = la.norm(obs["vel"])
-        # predict progress by integrating the velocity component along the path tangent, then
-        # correct it by projecting onto the path in a small window around the prediction
-        tangent = ref(self._progress, 1)
-        tangent = tangent / max(la.norm(tangent), 1e-9)
-        s_pred = np.clip(self._progress + dt * np.dot(obs["vel"], tangent), 0.0, ref.length)
-        current_progress = ref.project(obs["pos"], s_pred=s_pred)
-
-        s_k[0] = current_progress
-        v_k[0] = current_speed
-
-        for k in range(horizon):
-            v_k[k + 1] = min(self.speed_limit(s_k[k]), v_k[k] + self.a_long_max * dt)
-            s_k[k + 1] = s_k[k] + v_k[k] * dt  # ZOH
-
-        ref_window = np.hstack([ref(s_k), ref(s_k, 1) * v_k[:, None]])
-
-        self._progress = current_progress
-        return ref_window  # (H + 1, 6)
+    def _on_new_reference(self, ref: ProgressReference, obs: ObservationDict):
+        """Compute the velocity profile for a new path."""
+        self._grid, self._profile = self._compute_velocity_profile(ref, obs)
 
     def _compute_velocity_profile(
         self, ref: ProgressReference, obs: ObservationDict, eps: float = 1e-6, pass_tol: float = 0.2

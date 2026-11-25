@@ -17,7 +17,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Callable
 
 import numpy as np
-import numpy.linalg as la
 import toppra as ta
 from crazyflow.dynamics import load_params
 from toppra.constraint import LinearConstraint
@@ -30,7 +29,7 @@ if TYPE_CHECKING:
 
     from lsy_drone_racing.control.planner.high_level_planner import SplinePlanner
     from lsy_drone_racing.control.planner.reference import ProgressReference
-    from lsy_drone_racing.control.utils.types import ObservationDict, Trajectory
+    from lsy_drone_racing.control.utils.types import ObservationDict
 
 
 def thrust_limits(drone: str) -> tuple[float, float, float]:
@@ -174,9 +173,8 @@ class TOPPRAMidLevelController(MidLevelController):
             tilt_max: Largest tilt in rad of the thrust from the vertical.
             grid_ds: Spacing in meters of TOPP-RA's grid; has to resolve the sharpest curves.
         """
-        self._planner = planner
+        super().__init__(planner, a_long_max)
         self.v_max = v_max
-        self.a_long_max = a_long_max
         self.v_gate_max = v_max if v_gate_max is None else v_gate_max
         self.gate_window = gate_window
         self.gate_plateau = gate_plateau
@@ -185,46 +183,16 @@ class TOPPRAMidLevelController(MidLevelController):
         self.tilt_max = tilt_max
         self.grid_ds = grid_ds
 
-        self._reference: ProgressReference | None = None
         self._grid: NDArray | None = None  # (N,) progress of TOPP-RA's grid points
         self._profile: NDArray | None = None  # (N,) fastest speed at the grid points
-        self._progress = 0.0
-
-    @property
-    def reference(self) -> ProgressReference:
-        """The reference path the trajectory follows."""
-        return self._reference
-
-    @property
-    def progress(self) -> float:
-        """The drone's progress s in meters on the reference path."""
-        return self._progress
 
     def speed_limit(self, s: NDArray) -> NDArray:
         """Speed of the TOPP-RA profile at progress s (any shape)."""
         return np.interp(s, self._grid, self._profile)
 
-    def get_trajectory(self, obs: ObservationDict, horizon: int, dt: float) -> Trajectory:
-        """Reference trajectory from the drone's current progress on, following the profile."""
-        ref, updated = self._planner.plan(obs)
-        if updated or self._reference is None:
-            self._reference = ref
-            self._grid, self._profile = self._time_optimal_profile(ref, obs)
-
-        # predict the progress by integrating the speed along the path, then correct it by
-        # projecting the position onto the path around the prediction
-        tangent = ref(self._progress, nu=1)
-        s_pred = np.clip(self._progress + dt * np.dot(obs["vel"], tangent), 0.0, ref.length)
-        self._progress = float(ref.project(obs["pos"], s_pred=s_pred))
-
-        s = np.zeros(horizon + 1)
-        v = np.zeros(horizon + 1)
-        s[0], v[0] = self._progress, la.norm(obs["vel"])
-        for k in range(horizon):
-            v[k + 1] = min(self.speed_limit(s[k]), v[k] + self.a_long_max * dt)
-            s[k + 1] = s[k] + v[k] * dt
-
-        return np.hstack([ref(s), ref(s, nu=1) * v[:, None]])  # (H + 1, 6)
+    def _on_new_reference(self, ref: ProgressReference, obs: ObservationDict):
+        """Compute the time-optimal speed profile for a new path."""
+        self._grid, self._profile = self._time_optimal_profile(ref, obs)
 
     def _time_optimal_profile(
         self, ref: ProgressReference, obs: ObservationDict, max_retries: int = 100
