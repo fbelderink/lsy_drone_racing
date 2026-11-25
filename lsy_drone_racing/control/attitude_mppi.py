@@ -27,8 +27,9 @@ from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R
 
 from lsy_drone_racing.control import Controller
-from lsy_drone_racing.control.mid_level.curvature_mlc import CurvatureMidLevelController
+from lsy_drone_racing.control.mid_level.path_tracker import PathTracker
 from lsy_drone_racing.control.planner.high_level_planner import SplinePlanner
+from lsy_drone_racing.control.utils.utils import drone_collision_radius, gate_geometry
 
 if TYPE_CHECKING:
     from crazyflow import Sim
@@ -72,7 +73,8 @@ def state_derivative(x: Array, u: Array, params: dict) -> Array:
 def discretize(params: dict, dts: NDArray) -> dict:
     """Exact zero-order-hold discretization of the linear attitude and thrust dynamics.
 
-    Every attitude axis is the linear system `[a, a_dot]' = [[0, 1], [k_a, k_r]] [a, a_dot] + [0, k_c] u`
+    Every attitude axis is the linear system
+    `[a, a_dot]' = [[0, 1], [k_a, k_r]] [a, a_dot] + [0, k_c] u`
     and the thrust a first-order lag with rate `k_t`. Both are discretized exactly for each step
     length with a matrix exponential, which is stable and exact for any step length (Euler diverges
     for the roll/pitch dynamics near 0.12 s and is poor already at 0.06 s).
@@ -172,20 +174,37 @@ def rollout(
 
 COST_CONSTANTS = {
     "deviation_tolerance": 0.13,  # Tolerance in meters for a deviation from the reference
-    "velocity_tolerance": 0.5,  # Tolerance in m/s for a deviation from the reference velocity
+    "contouring_tolerance": 0.13,  # Tolerance in meters for the distance to the path
+    "velocity_tolerance": 0.5,  # Tolerance in m/s for flying faster than the reference speed
     "smoothness_tolerance": 1.0,  # Tolerance for control smoothness in multiples of sigma
-    "gate_tolerance": 0.07,  # Tolerance in meters for an acceptable deviation from a gate's center
-    "gate_slab": 0.1,  # Half-thickness in meters around a gate's plane in which the gate is checked
-    "gate_frame_limit": 0.45,  # Offset in meters from a gate's center beyond which it is clear
+    # Margin in meters the drone keeps from a gate's frame, on top of its collision radius. The
+    # frame's sizes ("gate_inner", "gate_outer", "gate_half_depth") and "drone_radius" are read
+    # from the MuJoCo models when the controller is created
+    "gate_margin": 0.01,
+    # Largest distance in meters from a gate's center at which crossing its plane counts as a
+    # miss; further away the plane is crossed elsewhere on the track, not at the gate
+    "gate_miss_radius": 1.0,
+    # Window of the reference path in which a rollout's progress is measured, around the drone's
+    # progress. Its ends are given in multiples of the reach, the distance a rollout covers at
+    # progress_max_speed over the horizon; the window is sampled every progress_ds meters
+    "progress_behind": 0.1,
+    "progress_ahead": 1.0,
+    "progress_ds": 0.05,
+    # Progress is tracked state by state along a rollout, so that it cannot jump to a later part
+    # of the path that passes close by: from one state to the next it may advance by at most
+    # progress_max_speed * dt and go back by at most progress_back meters
+    "progress_max_speed": 10.0,
+    "progress_back": 0.1,
     "obstacle_radius": 0.2,  # Radius in meters of the penalty tube around an obstacle
 }
 
 COST_WEIGHTS = {
-    "deviation_weight": 0.2,  # Weight for deviation from reference trajectory
-    "velocity_weight": 0.1,  # Weight for deviation from reference velocity
+    "progress_weight": 30.0,  # Reward per meter of progress along the path, see `progress_cost`
+    "contouring_weight": 0.8,  # Weight for the distance to the path, see `contouring_cost`
     "smoothness_weight": 0.01,  # Weight for control smoothness
-    "gate_weight": 100.0,  # Weight for gate pass / collision / miss
-    "obstacle_weight": 50.0,  # Weight for coming close to an obstacle
+    "gate_weight": 30.0,  # Weight for states inside a gate's frame
+    "gate_miss_weight": 300.0,  # Weight for missing the next gate, see `gate_miss_cost`
+    "obstacle_weight": 100.0,  # Weight for coming close to an obstacle
 }
 
 DEFAULT_PARAMS = {
@@ -206,29 +225,14 @@ DEFAULT_PARAMS = {
     "dist_axes": [0.0, 0.0, 1.0],
 }
 
-MLC_CONSTANTS = {
-    "v_max": 6.0,
-    "a_long_max": 10.0,
-    # Lateral acceleration in curves. With the speed cap around unrevealed gates this sets the lap
-    # time (the inputs are not saturated). 7 gives -0.54 s at the same success rate as 5; from 9 on
-    # the drone overshoots turns and misses gates, because the profile then demands faster changes
-    # of the thrust direction than the drone can make
-    "a_lat_max": 7.0,
-    "a_brake_max": 10.0,
-    "v_gate_max": 2.0,  # speed cap within the plateau around a gate
-    # progress in meters before and after a gate over which the cap stays flat (sensor range plus
-    # margin), and over which it applies
-    "gate_plateau": 0.9,
-    "gate_window": 1.0,
-}
-
 
 def trajectory_cost(
     X: Array,
     U: Array,
     u_prev: Array,
-    ref: Array,
     gates: Array,
+    target_gate: Array,
+    path_window: Array,
     obstacles_pos: Array,
     sigma: Array,
     cc: dict,
@@ -241,10 +245,11 @@ def trajectory_cost(
         X: State trajectory with shape (H + 1, 13).
         U: Control sequence with shape (H, 4).
         u_prev: Previous control input with shape (4,).
-        ref: Reference positions and tangential velocities with shape (H + 1, 6).
-            The first three columns are positions, the last three are velocities.
         gates: Position and normal vector of every gate with shape (n_gates, 6).
             The first three columns are positions, the last three are normal vectors.
+        target_gate: The next gate of the race with shape (7,), see `gate_miss_cost`.
+        path_window: The reference path around the drone's progress with shape (P, 4), see
+            `progress_cost`.
         obstacles_pos: Obstacle positions with shape (n_obstacles, 3). Obstacles are vertical
             poles, so only the x and y coordinates are used.
         sigma: Standard deviation of the control input with shape (4,).
@@ -255,17 +260,7 @@ def trajectory_cost(
     Returns:
         The scalar cost.
     """
-    # Deviation from reference trajectory
-    pos = X[:, :3]  # Extract positions from the state trajectory
-    ref_pos = ref[:, :3]  # Extract reference positions
-    tol = jnp.maximum(1e-6, cc["deviation_tolerance"])
-    pos_error_per_step = jnp.square((pos - ref_pos) / tol)  # Compute per-step position error
-    deviation_cost = jnp.sum(w[:, None] * pos_error_per_step)
-
-    # Deviation from the reference velocity, so the speed profile (e.g. slowing before gates) is followed
-    vel_tol = jnp.maximum(1e-6, cc["velocity_tolerance"])
-    vel_error_per_step = jnp.square((X[:, 6:9] - ref[:, 3:6]) / vel_tol)
-    velocity_cost = jnp.sum(w[:, None] * vel_error_per_step)
+    pos = X[:, :3]  # Positions of the rollout
 
     # Cost for control smoothness
     U_including_prev = jnp.vstack(
@@ -277,30 +272,11 @@ def trajectory_cost(
     control_diff /= cc["smoothness_tolerance"] * jnp.maximum(1e-6, sigma)
     smoothness_cost = jnp.sum(jnp.linalg.norm(control_diff, axis=1))
 
-    # Cost for gate collisi0 on: states near a gate's plane must be close to its center, for every gate
-    # get gate_pos and gate_normal
-    gate_pos = gates[:, :3]  # Extract gate positions
-    gate_normal = gates[:, 3:]  # Extract gate normal vectors
-    gate_offset = pos[:, None, :] - gate_pos[None, :, :]  # Offset of each state to each gate center
-    # a state is near a gate if it is within a thin slab around the gate's plane
-    distance = jnp.sum(gate_offset * gate_normal[None, :, :], axis=-1)
-    near_gate_mask = jnp.abs(distance) < cc["gate_slab"]
-    # use maxnorm(to not punish corners) of distance to gate center along gate plane primary axes
-    # primary axes are always vertical axis and the cross between normal and vertical axis
-    vertical_distance = gate_offset[..., 2]
-    horizontal_distance = jnp.sum(
-        gate_offset * jnp.cross(gate_normal, jnp.array([0, 0, 1]))[None, :, :], axis=-1
-    )
-    gate_plane_max_distance = jnp.maximum(jnp.abs(vertical_distance), jnp.abs(horizontal_distance))
-    # states beside the frame, outside of its outer edge, are free
-    frame_mask = near_gate_mask & (gate_plane_max_distance < cc["gate_frame_limit"])
-
-    # cost function based on distance to gate center
-    distance_further_than_tolerance = jnp.maximum(
-        gate_plane_max_distance / cc["gate_tolerance"] - 1, 0
-    )
-    slab_cost = jnp.where(frame_mask, distance_further_than_tolerance**2, 0)
-    gate_cost = jnp.sum(w[:, None] * slab_cost)
+    path_s, path_dist_sq = track_path(pos, path_window, cc)
+    progress = progress_cost(path_s)
+    contouring = contouring_cost(path_dist_sq, cc, w)
+    gate_cost = gate_frame_cost(pos, gates, cc, w)
+    miss_cost = gate_miss_cost(pos, target_gate, cc)
 
     # Cost for coming close to an obstacle: tube around each pole, checked in the x-y plane
     obstacle_xy_distance = jnp.linalg.norm(pos[:, None, :2] - obstacles_pos[None, :, :2], axis=-1)
@@ -309,12 +285,174 @@ def trajectory_cost(
     obstacle_cost = jnp.sum(w[:, None] * tube_penetration**2)
 
     return (
-        cw["deviation_weight"] * deviation_cost
-        + cw["velocity_weight"] * velocity_cost
+        cw["progress_weight"] * progress
+        + cw["contouring_weight"] * contouring
         + cw["smoothness_weight"] * smoothness_cost
         + cw["gate_weight"] * gate_cost
+        + cw["gate_miss_weight"] * miss_cost
         + cw["obstacle_weight"] * obstacle_cost
     )
+
+
+def track_path(pos: Array, path_window: Array, cc: dict) -> tuple[Array, Array]:
+    """Follow a rollout along the reference path: its progress and distance to the path per state.
+
+    The progress is tracked state by state, starting at the drone's progress (0) at the first
+    state: every state is projected onto the nearest window point within progress_back behind
+    and progress_max_step ahead of the previous state's progress. Projecting onto the whole
+    window instead would let a rollout claim a later part of the path that passes close by, e.g.
+    behind a gate it never flew through.
+
+    The distance to the path is the offset from that window point without its component along
+    the path's tangent there, so the spacing of the window's points does not add to it.
+
+    Args:
+        pos: Positions of the rollout with shape (H + 1, 3).
+        path_window: Points of the reference path with shape (P, 4): positions and their
+            progress relative to the drone's current progress, in meters.
+        cc: Cost constants, see `COST_CONSTANTS`.
+
+    Returns:
+        Progress (H,) in meters relative to the drone's progress and squared distance (H,) to the
+        path, of the states after the first.
+    """
+    points, offsets = path_window[:, :3], path_window[:, 3]
+    tangents = jnp.diff(points, axis=0, append=2 * points[-1:] - points[-2:-1])
+    tangents /= jnp.maximum(jnp.linalg.norm(tangents, axis=-1, keepdims=True), 1e-9)
+
+    def step(s_prev: Array, p: Array) -> tuple[Array, tuple[Array, Array]]:
+        reachable = (offsets >= s_prev - cc["progress_back"]) & (
+            offsets <= s_prev + cc["progress_max_step"]
+        )
+        nearest = jnp.argmin(
+            jnp.where(reachable, jnp.sum(jnp.square(points - p), axis=-1), jnp.inf)
+        )
+        d = p - points[nearest]
+        lateral = d - jnp.dot(d, tangents[nearest]) * tangents[nearest]
+        return offsets[nearest], (offsets[nearest], jnp.sum(jnp.square(lateral)))
+
+    _, (s, dist_sq) = jax.lax.scan(step, jnp.asarray(0.0, dtype=offsets.dtype), pos[1:])
+    return s, dist_sq
+
+
+def progress_cost(path_s: Array) -> Array:
+    """Negative progress along the reference path at the end of the rollout, in meters.
+
+    As the softmin weights only depend on cost differences, rewarding progress is the same as
+    penalizing the lack of it: hovering or flying backwards costs more than every rollout that
+    advances.
+
+    Args:
+        path_s: Progress (H,) of the rollout's states after the first, see `track_path`.
+
+    Returns:
+        The scalar cost, the negative progress.
+    """
+    return -path_s[-1]
+
+
+def contouring_cost(path_dist_sq: Array, cc: dict, w: Array) -> Array:
+    """Cost of the distance to the reference path, independent of time.
+
+    Unlike the deviation from the time-indexed reference, it does not care where along the path
+    a state is, so it does not pull a rollout towards a reference that runs ahead or behind.
+
+    Args:
+        path_dist_sq: Squared distance (H,) of the rollout's states after the first to the
+            path, see `track_path`.
+        cc: Cost constants, see `COST_CONSTANTS`.
+        w: Weight of every state's running costs with shape (H + 1,).
+
+    Returns:
+        The scalar cost.
+    """
+    tol = jnp.maximum(1e-6, cc["contouring_tolerance"])
+    return jnp.sum(w[1:] * path_dist_sq / tol**2)
+
+
+def gate_frame_coordinates(offset: Array, normal: Array) -> tuple[Array, Array]:
+    """Split offsets from a gate's center into the distance to its plane and the in-plane offset.
+
+    Args:
+        offset: Offsets from the gate's center with shape (..., 3).
+        normal: The gate's unit normal with shape (..., 3), broadcastable to offset.
+
+    Returns:
+        The signed distance to the plane along the normal, and the in-plane offset in the
+        max-norm of the gate's horizontal and vertical axis (the frame is square), both (...).
+    """
+    horizontal_axis = jnp.cross(normal, jnp.array([0.0, 0.0, 1.0]))
+    horizontal_axis /= jnp.maximum(jnp.linalg.norm(horizontal_axis, axis=-1, keepdims=True), 1e-9)
+    along_normal = jnp.sum(offset * normal, axis=-1)
+    in_plane = jnp.maximum(
+        jnp.abs(jnp.sum(offset * horizontal_axis, axis=-1)), jnp.abs(offset[..., 2])
+    )
+    return along_normal, in_plane
+
+
+def gate_frame_cost(pos: Array, gates: Array, cc: dict, w: Array) -> Array:
+    """Cost of the states inside a gate's frame, for every gate.
+
+    The frame is a square ring around the opening, inflated by the drone's radius and the margin.
+    States in the opening or beside the frame are free. Inside the frame, the cost rises from 1
+    at its edges with the depth into it, in multiples of the inflation.
+
+    Args:
+        pos: Positions of the rollout with shape (H + 1, 3).
+        gates: Position and normal vector of every gate with shape (n_gates, 6).
+        cc: Cost constants, see `COST_CONSTANTS`.
+        w: Weight of every state's running costs with shape (H + 1,).
+
+    Returns:
+        The scalar cost.
+    """
+    r = cc["drone_radius"] + cc["gate_margin"]
+    inner, outer = cc["gate_inner"] - r, cc["gate_outer"] + r
+    along_normal, in_plane = gate_frame_coordinates(
+        pos[:, None, :] - gates[None, :, :3], gates[None, :, 3:]
+    )  # (H + 1, n_gates)
+    in_frame = (
+        (jnp.abs(along_normal) < cc["gate_half_depth"] + r)
+        & (in_plane > inner)
+        & (in_plane < outer)
+    )
+    depth = jnp.minimum(in_plane - inner, outer - in_plane) / r
+    return jnp.sum(w[:, None] * jnp.where(in_frame, (1 + depth) ** 2, 0.0))
+
+
+def gate_miss_cost(pos: Array, target_gate: Array, cc: dict) -> Array:
+    """Cost of missing the next gate: crossing its plane outside the opening.
+
+    Only the next gate of the race is checked, in the direction it has to be passed. A crossing
+    outside the safe opening (opening minus drone radius and margin) within gate_miss_radius of
+    the gate's center is a miss, which includes flying past the gate. Rollouts that do not reach
+    the plane are not judged here, how fast to get there is left to the other costs.
+
+    A miss is not discounted like the running costs: it decides the race wherever in the horizon
+    it happens, and a discounted miss far ahead would be cheaper than slowing down now to avoid
+    it.
+
+    Args:
+        pos: Positions of the rollout with shape (H + 1, 3).
+        target_gate: Position, normal in the passing direction and a validity flag (1 if there is
+            a next gate, else 0) of the next gate, shape (7,).
+        cc: Cost constants, see `COST_CONSTANTS`.
+
+    Returns:
+        The scalar cost, 1 if the rollout misses the gate, else 0.
+    """
+    center, normal, valid = target_gate[:3], target_gate[3:6], target_gate[6]
+    opening = cc["gate_inner"] - cc["drone_radius"] - cc["gate_margin"]
+
+    # steps (H,) that cross the plane forwards, and where between the two states they cross it
+    x = (pos - center) @ normal
+    forward = (x[:-1] < 0) & (x[1:] >= 0)
+    t = x[:-1] / jnp.where(forward, x[:-1] - x[1:], 1.0)
+    crossing_pos = pos[:-1] + t[:, None] * (pos[1:] - pos[:-1])
+    _, in_plane = gate_frame_coordinates(crossing_pos - center, normal)
+
+    miss = forward & (in_plane > opening) & (in_plane < cc["gate_miss_radius"])
+    return valid * jnp.any(miss)
 
 
 def adaptive_lambda(costs: Array, target_ess: float, n_iter: int = 30) -> Array:
@@ -333,11 +471,11 @@ def adaptive_lambda(costs: Array, target_ess: float, n_iter: int = 30) -> Array:
     costs = costs - jnp.min(costs)
     target = target_ess * costs.shape[0]
 
-    def ess(log_lam):
+    def ess(log_lam: Array) -> Array:
         weights = jax.nn.softmax(-costs / jnp.exp(log_lam))
         return 1 / jnp.sum(weights**2)
 
-    def bisect(_, bounds):
+    def bisect(_, bounds: tuple[Array, Array]) -> Array:
         lo, hi = bounds
         mid = 0.5 * (lo + hi)
         too_peaked = ess(mid) < target
@@ -419,8 +557,9 @@ def mppi_update(
     x0: Array,
     U_nom: Array,
     u_prev: Array,
-    ref: Array,
     gates: Array,
+    target_gate: Array,
+    path_window: Array,
     obstacles_pos: Array,
     params: dict,
     grid: dict,
@@ -444,8 +583,10 @@ def mppi_update(
         x0: Current state with shape (13,).
         U_nom: Nominal control sequence with shape (H, 4).
         u_prev: Previous control sequence with shape (4,).
-        ref: Reference positions and velocities with shape (H + 1, 6).
         gates: Position and normal vector of every gate with shape (n_gates, 6).
+        target_gate: The next gate of the race with shape (7,), see `gate_miss_cost`.
+        path_window: The reference path around the drone's progress with shape (P, 4), see
+            `progress_cost`.
         obstacles_pos: Obstacle positions with shape (n_obstacles, 3).
         params: Drone parameters.
         grid: Time grid of the horizon: `dts` (H,) step lengths, `w` (H + 1,) cost weight of every
@@ -484,7 +625,9 @@ def mppi_update(
         return rollout(x0, U, params, dts, disc, dist_acc)
 
     def cost_one(X: Array, U: Array) -> Array:
-        return trajectory_cost(X, U, u_prev, ref, gates, obstacles_pos, sigma, cc, cw, w)
+        return trajectory_cost(
+            X, U, u_prev, gates, target_gate, path_window, obstacles_pos, sigma, cc, cw, w
+        )
 
     rollouts = jax.vmap(rollout_one)(sampled_actions)
     costs = jax.vmap(cost_one)(rollouts, sampled_actions)
@@ -553,16 +696,23 @@ class AttitudeMPPI(Controller):
         # Tunables, overridable through `config.controller.mppi` (used by the benchmark harness)
         overrides = dict(config.controller.get("mppi", {}))
         p = {**DEFAULT_PARAMS, **{k: v for k, v in overrides.items() if k in DEFAULT_PARAMS}}
-        unknown = set(overrides) - set(DEFAULT_PARAMS) - {"cost_constants", "cost_weights", "mlc"}
+        unknown = set(overrides) - set(DEFAULT_PARAMS) - {"cost_constants", "cost_weights"}
         if unknown:
             raise ValueError(f"Unknown MPPI parameters: {sorted(unknown)}")
         self._p = p
-        self._cc = {**COST_CONSTANTS, **dict(overrides.get("cost_constants", {}))}
+        gate = gate_geometry()
+        geometry = {
+            "gate_inner": gate.inner,
+            "gate_outer": gate.outer,
+            "gate_half_depth": gate.half_depth,
+            "drone_radius": drone_collision_radius(config.sim.drone),
+        }
+        self._cc = {**COST_CONSTANTS, **geometry, **dict(overrides.get("cost_constants", {}))}
         self._cw = {**COST_WEIGHTS, **dict(overrides.get("cost_weights", {}))}
-        mlc = {**MLC_CONSTANTS, **dict(overrides.get("mlc", {}))}
 
         self._freq = config.env.freq
         self._dt = 1 / self._freq
+        self._cc["progress_max_step"] = self._cc["progress_max_speed"] * self._dt
         self._horizon = int(p["horizon"])  # number of planning steps
         self._dts = np.full(self._horizon, self._dt, dtype=np.float32)
         # Running costs further ahead weigh less, see `discount_tau`
@@ -593,31 +743,15 @@ class AttitudeMPPI(Controller):
             / self._params["cmd_f_coef"]
         )
 
-        self._mlc = CurvatureMidLevelController(
+        # The path from the high level planner and the drone's progress on it; the path window
+        # around the progress reaches as far as a rollout can get at progress_max_speed
+        self._tracker = PathTracker(
             SplinePlanner(obs, config),
-            v_max=mlc["v_max"],
-            a_long_max=mlc["a_long_max"],
-            a_lat_max=mlc["a_lat_max"],
-            a_brake_max=mlc["a_brake_max"],
-            v_gate_max=mlc["v_gate_max"],
-            gate_window=mlc["gate_window"],
-            gate_plateau=mlc["gate_plateau"],
+            window_speed=self._cc["progress_max_speed"],
+            window_behind=self._cc["progress_behind"],
+            window_ahead=self._cc["progress_ahead"],
+            window_ds=self._cc["progress_ds"],
         )
-
-        """
-        self._mlc = TOPPRAMidLevelController(
-            SplinePlanner(obs, config),
-            config,
-            v_max=mlc["v_max"],
-            a_long_max=mlc["a_long_max"],
-            v_gate_max=mlc["v_gate_max"],
-            gate_window=mlc["gate_window"],
-            gate_plateau=mlc["gate_plateau"],
-            thrust_ratio=0.8,
-            tilt_max=1.0,
-            grid_ds=0.01,
-        )
-        """
 
         # Disturbance estimate and the one-step prediction it is updated from
         self._dist_alpha = float(p["dist_alpha"])
@@ -649,7 +783,7 @@ class AttitudeMPPI(Controller):
         self._obstacle_now = None  # positions of the currently perceived obstacles
         self._obstacle_old = []  # per obstacle, the positions perceived before the current one
 
-        self._ref = self._reference(obs)
+        self._tracker.update(obs, self._horizon, self._dt)
 
         # Warm-up call so the jit compilation happens here and not in the first control step
         jax.block_until_ready(self._run_update(self._key, obs))
@@ -661,8 +795,9 @@ class AttitudeMPPI(Controller):
             self._state(obs),
             self._U_nom,
             self._u_prev,
-            self._ref,
             self._get_gates_pos_and_normal(obs),
+            self._target_gate(obs),
+            self._path_window(),
             jnp.asarray(obs["obstacles_pos"]),
             self._params_dev,
             self._grid,
@@ -674,9 +809,9 @@ class AttitudeMPPI(Controller):
             dist_acc=jnp.asarray(self._dist) if self._dist_alpha > 0 else None,
         )
 
-    def _reference(self, obs: dict[str, NDArray[np.floating]]) -> NDArray:
-        """Sample the mid-level reference over the horizon, shape (H + 1, 6)."""
-        return self._mlc.get_trajectory(obs, self._horizon, self._dt)
+    def _path_window(self) -> Array:
+        """The reference path around the drone's progress, see `track_path`, shape (P, 4)."""
+        return jnp.asarray(self._tracker.path_window(), dtype=jnp.float32)
 
     def _state(self, obs: dict[str, NDArray[np.floating]]) -> Array:
         """Convert an observation to the planning state [pos, rpy, vel, drpy, thrust]."""
@@ -699,10 +834,10 @@ class AttitudeMPPI(Controller):
         Returns:
             The command [roll, pitch, yaw, thrust] as a numpy array.
         """
-        if self._mlc.progress >= self._mlc.reference.length:
+        if self._tracker.progress >= self._tracker.reference.length:
             self._finished = True
 
-        self._ref = self._reference(obs)
+        self._tracker.update(obs, self._horizon, self._dt)
         self._track_gate_perception(obs)
         self._track_obstacle_perception(obs)
         self._update_disturbance(obs)
@@ -762,7 +897,7 @@ class AttitudeMPPI(Controller):
         return self._finished or int(obs["n_gates_passed"]) == len(obs["gate_sequence"])
 
     def render_callback(self, sim: Sim):
-        """Draw the reference by speed, the sampled rollouts by weight and the mean action path.
+        """Draw the path and its window, the sampled rollouts by weight and the mean action path.
 
         Items that no longer fit into the viewer's scene are skipped, the rollouts first.
         """
@@ -772,17 +907,20 @@ class AttitudeMPPI(Controller):
             return
 
         # Reference path from high level planner
-        _, ref_path = self._mlc.reference.sample(num_samples=200)
+        _, ref_path = self._tracker.reference.sample(num_samples=200)
         draw_line(sim, ref_path, rgba=(0.0, 1.0, 0.0, 1.0))
 
-        # Local reference trajectory handed to MPPI, colored by its speed
-        ref_pos = self._ref[:, :3]
-        colors = speed_to_rgba(np.linalg.norm(self._ref[:, 3:6], axis=1)[:-1])
-        for i in range(len(ref_pos) - 1):
-            draw_line(sim, ref_pos[i : i + 2], rgba=colors[i], start_size=3.0, end_size=3.0)
+        # Window of the path in which the rollouts' progress and distance are measured
+        window = self._tracker.path_window()[:, :3]
+        draw_line(sim, window, rgba=(1.0, 0.9, 0.0, 1.0), start_size=3.0, end_size=3.0)
 
-        # Reference point the drone should be tracking right now
-        draw_points(sim, ref_pos[:1], rgba=(1.0, 0.9, 0.0, 1.0), size=0.03)
+        # The drone's progress on the path
+        draw_points(
+            sim,
+            self._tracker.reference(self._tracker.progress)[None],
+            rgba=(1.0, 0.9, 0.0, 1.0),
+            size=0.03,
+        )
         """
         self._draw_gate_perception(sim)
         self._draw_obstacle_perception(sim)
@@ -829,7 +967,8 @@ class AttitudeMPPI(Controller):
         if self._gate_now is None:
             return
         cyan, orange = (0.0, 0.9, 1.0, 1.0), (1.0, 0.5, 0.0, 0.4)
-        tolerance = self._cc["gate_tolerance"]
+        # half width of the opening the drone's center can pass without touching the frame
+        safe = self._cc["gate_inner"] - self._cc["drone_radius"] - self._cc["gate_margin"]
         for i, (pos, quat) in enumerate(zip(*self._gate_now)):
             # Earlier perceptions, linked to where the gate is perceived now
             for old_pos, old_quat in self._gate_old[i]:
@@ -841,7 +980,7 @@ class AttitudeMPPI(Controller):
                     end_size=1.5,
                 )
                 draw_line(sim, np.stack((old_pos, pos)), rgba=orange, start_size=1.5, end_size=1.5)
-            # Current perception: opening and the tolerance square the gate cost treats as free
+            # Current perception: opening and the square inside it the gate cost treats as free
             draw_line(
                 sim,
                 gate_outline(pos, quat, GATE_OPENING_HALF),
@@ -849,12 +988,10 @@ class AttitudeMPPI(Controller):
                 start_size=4.0,
                 end_size=4.0,
             )
-            draw_line(
-                sim, gate_outline(pos, quat, tolerance), rgba=cyan, start_size=2.0, end_size=2.0
-            )
+            draw_line(sim, gate_outline(pos, quat, safe), rgba=cyan, start_size=2.0, end_size=2.0)
 
     def _track_obstacle_perception(self, obs: dict[str, NDArray[np.floating]]):
-        """Store the previously perceived position of every obstacle whose observed position changed."""
+        """Store the previously perceived position of every updated obstacle."""
         pos = np.array(obs["obstacles_pos"])
         if self._obstacle_now is None:
             self._obstacle_old = [[] for _ in pos]
@@ -870,7 +1007,8 @@ class AttitudeMPPI(Controller):
             return
         cyan, orange = (0.0, 0.9, 1.0, 1.0), (1.0, 0.5, 0.0, 0.4)
         radius = self._cc["obstacle_radius"]
-        z_tube = float(self._ref[0, 2])  # tube is drawn at the height the drone is flying at
+        # tube is drawn at the height of the path at the drone's progress
+        z_tube = float(self._tracker.reference(self._tracker.progress)[2])
         for i, pos in enumerate(self._obstacle_now):
             # Earlier perceptions, linked to where the obstacle is perceived now
             for old_pos in self._obstacle_old[i]:
@@ -918,3 +1056,14 @@ class AttitudeMPPI(Controller):
         # The gate normal is the gate's local x-axis in the world frame
         gates_normal = R.from_quat(obs["gates_quat"]).apply([1, 0, 0])
         return jnp.hstack([obs["gates_pos"], gates_normal])
+
+    def _target_gate(self, obs: dict[str, NDArray[np.floating]]) -> Array:
+        """Position, normal in the passing direction and validity flag of the next gate, (7,)."""
+        n_passed = int(obs["n_gates_passed"])
+        if not 0 <= n_passed < len(obs["gate_sequence"]):
+            return jnp.zeros(7)  # race finished: no gate to miss
+        gate = int(obs["gate_sequence"][n_passed])
+        direction = float(obs["gate_sequence_direction"][n_passed])
+        normal = direction * R.from_quat(obs["gates_quat"][gate]).apply([1.0, 0.0, 0.0])
+        center = jnp.asarray(obs["gates_pos"][gate])
+        return jnp.concatenate([center, jnp.asarray(normal), jnp.ones(1)])
