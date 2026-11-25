@@ -30,3 +30,6 @@ acados/
 
 # PMM planner CLI build
 tools/pmm_cli/build/
+
+# Tuning results (scripts/tune_mpcc_pp.py)
+tuning_runs/

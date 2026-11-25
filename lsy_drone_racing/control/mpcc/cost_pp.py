@@ -14,7 +14,8 @@ thrust differences, and rpy rates replace the body rates.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -28,11 +29,14 @@ from lsy_drone_racing.control.mpcc.corridor import (
     tunnel_half_width_profile,
 )
 from lsy_drone_racing.control.mpcc.cost import ProgressLimits, contouring_errors
+from lsy_drone_racing.control.mpcc.mppi_mpcc import COLLISION_WEIGHTS
 from lsy_drone_racing.control.mpcc.path import path_lookup, profile_lookup
 from lsy_drone_racing.control.utils.collision import GATE_INNER_HALF_WIDTH
 from lsy_drone_racing.control.utils.utils import drone_collision_radius
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from crazyflow import Sim
     from jax import Array
     from numpy.typing import NDArray
@@ -40,30 +44,37 @@ if TYPE_CHECKING:
     from lsy_drone_racing.control.mpcc.path import ArcLengthPath
     from lsy_drone_racing.control.planner.centerline import CenterlinePlanner
 
+# The tuned values below come from `scripts/tune_mpcc_pp.py` and are kept at full precision: the
+# closed loop amplifies even rounding-level changes of the weights into different flights.
 MPCC_PP_WEIGHTS = {
-    # Lag weight, high so that theta stays a good estimate of the closest point
-    "q_lag": 1000.0,
-    # Contour weights along the tunnel's horizontal and upward axes. Low, since the tunnel and not
-    # the contour cost keeps the drone clear of the gates
-    "q_contour_h": 50.0,
-    "q_contour_v": 100.0,
-    "q_rates_rp": 0.01,  # Weight for roll and pitch rates
-    "q_rates_yaw": 0.01,  # Weight for the yaw rate
-    "r_du": jnp.array([1.0, 1.0, 1.0, 1.0]),  # Weights for command changes per channel
-    "r_v_theta": 2.0,  # Weight for the squared progress speed
-    # Additional weight for the squared progress speed near an unrevealed gate. With mu = 40 and
-    # r_v_theta = 2, the preferred progress speed there is 40 / (2 * (2 + 8)) = 2 m/s
-    "r_v_theta_unrevealed": 8.0,
+    # Lag weight, high so that theta stays a good estimate of the closest point (tuned)
+    "q_lag": 2003.9231253985897,
+    # Contour weights along the tunnel's horizontal and upward axes (tuned). Low, since the tunnel
+    # and not the contour cost keeps the drone clear of the gates
+    "q_contour_h": 40.22683513603317,
+    "q_contour_v": 395.06866235912594,
+    "q_rates_rp": 0.0061208242460775875,  # Weight for roll and pitch rates (tuned)
+    # Weight for the yaw rate. Without yaw noise, all samples have the same yaw rate, so this weight
+    # has no effect and is not tuned
+    "q_rates_yaw": 0.01,
+    # Weights for command changes per channel (tuned, the same for all channels)
+    "r_du": jnp.full(4, 0.904801132215005),
+    # Weight for the squared progress speed (tuned). The preferred progress speed is
+    # mu / (2 * r_v_theta), about 7.4 m/s
+    "r_v_theta": 7.836243719585712,
+    # Additional weight for the squared progress speed near an unrevealed gate (tuned). The
+    # preferred progress speed there is mu / (2 * (r_v_theta + r_v_theta_unrevealed)), about 2.4 m/s
+    "r_v_theta_unrevealed": 16.87366843284105,
     # Distance in meters over which the additional weight fades in at `slow_radius` from the gate
     "slow_sigma": 0.1,
-    "mu": 40.0,  # Reward for progress speed
+    "mu": 116.15527473906332,  # Reward for progress speed (tuned)
     "w_tunnel": 1000.0,  # Weight of the tunnel barrier
     "alpha": 100.0,  # Slope of the tunnel barrier in 1/m
 }
 
 # Tunnel shape, see `corridor.tunnel_half_width_profile`
 TUNNEL_MARGIN = 0.03  # Clearance in meters to the gate opening's edge, beyond the drone's radius
-TUNNEL_W_NOMINAL = 1.0  # Half-width in meters away from gates
+TUNNEL_W_NOMINAL = 1.2892846530813704  # Half-width in meters away from gates (tuned)
 # The half-width is within 1 % of its value at the gate up to 0.1 m from the gate, which covers the
 # drone's radius plus the frame's depth, and back to nominal about 0.6 m from the gate
 TUNNEL_D_MID = 0.35
@@ -75,6 +86,62 @@ GATE_PASS_MARGIN = 0.1
 
 # How far in meters beyond the sensor range around an unrevealed gate the drone already slows down
 SLOW_MARGIN = 0.3
+
+# Obstacle and crash cost weights of MPCC++, see `mppi_mpcc.COLLISION_WEIGHTS` (w_obs and w_crash
+# tuned). The shared defaults stay unchanged for the other MPCC controllers.
+MPCC_PP_COLLISION_WEIGHTS = COLLISION_WEIGHTS | {
+    "w_obs": 17.927181046581076,
+    "w_crash": 2972.7668810521463,
+}
+
+
+@dataclass(frozen=True)
+class MPCCPPParams:
+    """Tunable parameters of the MPCC++ controller, by default the module's constants.
+
+    Attributes:
+        weights: Cost weights, see `MPCC_PP_WEIGHTS`.
+        tunnel_w_nominal: Tunnel half-width in meters away from gates.
+        collision_weights: Obstacle and crash cost weights, see `MPCC_PP_COLLISION_WEIGHTS`.
+    """
+
+    weights: dict = field(default_factory=lambda: dict(MPCC_PP_WEIGHTS))
+    tunnel_w_nominal: float = TUNNEL_W_NOMINAL
+    collision_weights: dict = field(default_factory=lambda: dict(MPCC_PP_COLLISION_WEIGHTS))
+
+    @classmethod
+    def from_overrides(cls, overrides: Mapping[str, Any]) -> MPCCPPParams:
+        """The default parameters with some of them replaced.
+
+        The cost weights keep the types of the defaults, so that new values do not recompile the
+        jitted MPPI update. The collision weights are compile-time constants of `MPPIMPCC`.
+
+        Args:
+            overrides: New values by name: any key of `MPCC_PP_WEIGHTS` ("r_du" as a sequence of 4
+                values), "tunnel_w_nominal", "w_obs" and "w_crash".
+
+        Returns:
+            The parameters.
+
+        Raises:
+            KeyError: If a name is none of the above.
+        """
+        weights = dict(MPCC_PP_WEIGHTS)
+        collision_weights = dict(MPCC_PP_COLLISION_WEIGHTS)
+        tunnel_w_nominal = TUNNEL_W_NOMINAL
+        for name, value in overrides.items():
+            if name == "tunnel_w_nominal":
+                tunnel_w_nominal = float(value)
+            elif name in ("w_obs", "w_crash"):
+                collision_weights[name] = float(value)
+            elif name == "r_du":
+                weights["r_du"] = jnp.asarray(value, dtype=MPCC_PP_WEIGHTS["r_du"].dtype)
+            elif name in weights:
+                weights[name] = float(value)
+            else:
+                raise KeyError(f"Unknown MPCC++ parameter: {name}")
+        return cls(weights, tunnel_w_nominal, collision_weights)
+
 
 # Path points between drawn tunnel cross-sections. Every drawn segment uses one of the viewer's 1000
 # geoms, and the rollouts already use most of them.
@@ -184,13 +251,17 @@ class CorridorObjective:
     # the drone is still before the gate, and the drone then flies around the gate.
     limits = ProgressLimits(v_max=jnp.inf, dv_max=jnp.inf, v_slow=jnp.inf, slack=1.0)
 
-    def __init__(self, config: dict, planner: CenterlinePlanner):
+    def __init__(
+        self, config: dict, planner: CenterlinePlanner, params: MPCCPPParams | None = None
+    ):
         """Initialize the objective.
 
         Args:
             config: The race configuration.
             planner: Planner of the centerline, which provides the gate crossings.
+            params: Cost weights and tunnel width, the defaults if None.
         """
+        self._params = MPCCPPParams() if params is None else params
         self._planner = planner
         self._w_gate = (
             GATE_INNER_HALF_WIDTH - drone_collision_radius(config.sim.drone) - TUNNEL_MARGIN
@@ -209,7 +280,7 @@ class CorridorObjective:
             path,
             self._planner.gate_progress,
             self._w_gate,
-            TUNNEL_W_NOMINAL,
+            self._params.tunnel_w_nominal,
             TUNNEL_D_MID,
             TUNNEL_STEEPNESS,
         )
@@ -219,7 +290,7 @@ class CorridorObjective:
     def cost_inputs(self, obs: dict[str, NDArray[np.floating]]) -> dict:
         """The weights, the tunnel's half-width and the gates for the slowdown."""
         return {
-            "weights": MPCC_PP_WEIGHTS,
+            "weights": self._params.weights,
             "half_width": self._half_width,
             "gates_pos": jnp.asarray(obs["gates_pos"]),
             "gates_revealed": jnp.asarray(obs["gates_visited"]),

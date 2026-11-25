@@ -256,6 +256,7 @@ def test_mppi_mpcc_update_runs_with_rollout_model(make_objective: Callable):
         cost_inputs=objective.cost_inputs(
             {"gates_pos": np.asarray(GATES[:, :3]), "gates_visited": np.array([True])}
         ),
+        collision_weights=COLLISION_WEIGHTS,
         limits=objective.limits,
         params=params,
         dt=dt,

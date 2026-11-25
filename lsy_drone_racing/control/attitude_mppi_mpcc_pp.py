@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from lsy_drone_racing.control import Controller
-from lsy_drone_racing.control.mpcc.cost_pp import CorridorObjective
+from lsy_drone_racing.control.mpcc.cost_pp import CorridorObjective, MPCCPPParams
 from lsy_drone_racing.control.mpcc.mppi_mpcc import MPPIMPCC
 from lsy_drone_racing.control.planner.centerline import CenterlinePlanner
 
@@ -45,19 +45,23 @@ class AttitudeMPPIMPCCPP(Controller):
         Args:
             obs: The initial observation of the environment's state.
             info: Additional environment information from the reset.
-            config: The race configuration.
+            config: The race configuration. An optional `config.controller.params` overrides
+                parameters by name, see `MPCCPPParams.from_overrides`. Only tuning scripts set it,
+                in memory.
         """
         super().__init__(obs, info, config)
+        params = MPCCPPParams.from_overrides(config.controller.get("params", {}))
         planner = CenterlinePlanner(obs, config)
         self._mpcc = MPPIMPCC(
             obs,
             config,
             planner,
-            CorridorObjective(config, planner),
+            CorridorObjective(config, planner, params),
             carry_window=CARRY_WINDOW,
             gate_margin=GATE_MARGIN,
             progress_window=PROGRESS_WINDOW,
             horizon=HORIZON,
+            collision_weights=params.collision_weights,
         )
 
     def compute_control(

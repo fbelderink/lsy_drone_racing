@@ -19,6 +19,7 @@ conventions:
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING, Protocol
 
 import jax
@@ -241,6 +242,7 @@ def mppi_mpcc_update(
     sigma: Array,
     sigma_dv_theta: float,
     target_ess: float,
+    collision_weights: dict,
 ) -> tuple[Array, ...]:
     """Perform one MPPI iteration on the MPCC cost.
 
@@ -277,6 +279,7 @@ def mppi_mpcc_update(
         sigma: Per-channel standard deviation of the command noise with shape (4,).
         sigma_dv_theta: Standard deviation of the progress acceleration noise.
         target_ess: Desired effective sample size as a fraction of n_samples.
+        collision_weights: Obstacle and crash cost weights, see `COLLISION_WEIGHTS`.
 
     Returns:
         - U_new: The updated command sequence with shape (H, 4).
@@ -328,7 +331,7 @@ def mppi_mpcc_update(
         X = freeze_after_crash(X, crashed)
         clearance = obstacle_clearance(X[:, :3], obstacles_pos, obstacles_inflation, radius)
         contouring = cost_fn(X, U, u_prev, theta, v_theta * ~crashed, dv_theta, path, cost_inputs)
-        return contouring + collision_cost(clearance, crashed, COLLISION_WEIGHTS)
+        return contouring + collision_cost(clearance, crashed, collision_weights)
 
     costs = jax.vmap(rollout_cost)(rollouts, sampled_actions, theta, v_theta, dv_theta)
 
@@ -498,6 +501,7 @@ class MPPIMPCC:
         gate_margin: float = 0.0,
         progress_window: tuple[float, float] = PROGRESS_WINDOW,
         horizon: int = 25,
+        collision_weights: dict = COLLISION_WEIGHTS,
     ):
         """Initialize the optimizer and compile the update.
 
@@ -516,6 +520,7 @@ class MPPIMPCC:
             progress_window: (behind, ahead) window in meters around the predicted progress in
                 which the drone's progress is measured every step.
             horizon: Number of planning steps of length 1 / config.env.freq.
+            collision_weights: Obstacle and crash cost weights, see `COLLISION_WEIGHTS`.
         """
         self._dt = 1 / config.env.freq
         self._horizon = horizon
@@ -551,7 +556,12 @@ class MPPIMPCC:
         self._objective.on_new_path(self._path)
         self._path_version = self._reference._version
 
-        self._update = jax.jit(mppi_mpcc_update, static_argnames=("n_samples", "cost_fn"))
+        # The collision weights are compile-time constants: as traced inputs, they change the
+        # rounding of the costs, and the closed loop amplifies that to different flights
+        self._update = jax.jit(
+            partial(mppi_mpcc_update, collision_weights=collision_weights),
+            static_argnames=("n_samples", "cost_fn"),
+        )
         self._key = jax.random.key(0)
         # Warm start: hold hover thrust with level attitude, at zero progress speed
         self._U_nom = jnp.tile(jnp.array([0.0, 0.0, 0.0, self._hover_thrust]), (self._horizon, 1))
