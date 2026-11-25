@@ -1,9 +1,9 @@
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from typing import NamedTuple
 
 import crazyflow
 import numpy as np
-import numpy.linalg as la
 from numpy.typing import NDArray
 from scipy.spatial.transform import Rotation as R
 
@@ -55,20 +55,23 @@ def obstacle_radius() -> float:
     return float(geom.get("size").split()[0])
 
 
-def dist_to_segment(pts, a, b):
-    """Pointwise distance to the segment described by a->b.
+class GateGeometry(NamedTuple):
+    """Collision geometry of a gate's frame, a square ring in the gate's plane."""
 
-    pts: (N, 3)
-    a: (M, 3)
-    b: (M, 3)
+    inner: float  # Half-width of the opening
+    outer: float  # Half-width of the frame's outer edge
+    half_depth: float  # Half-thickness of the frame along the gate's normal
 
-    returns: (N, M, 1) distance of every point to every segment
+
+def gate_geometry() -> GateGeometry:
+    """Frame geometry of the gates from the environment's MuJoCo model.
+
+    The frame collides as four bars around the opening. The top bar, a box centered above the
+    opening, gives all sizes: its x size is the half-depth, y the outer half-width, and its lower
+    edge (center z minus z size) the half-width of the opening.
     """
-    ab = b - a  # (M, 3)
-    ap = pts[:, None, :] - a[None, :, :]  # (N, M, 3)
-    t = np.sum(ap * ab, axis=-1, keepdims=True) / np.sum(
-        ab * ab, axis=-1, keepdims=True
-    )  # (N, M, 1)
-    t = np.clip(t, 0.0, 1.0)
-    closest = a[None, :, :] + t * ab[None, :, :]  # (N, M, 3)
-    return la.norm(pts[:, None, :] - closest, axis=-1, keepdims=True)  # (N, M, 1)
+    xml_path = Path(__file__).parents[2] / "envs" / "assets" / "gate.xml"
+    geom = ET.parse(xml_path).getroot().find(".//geom[@name='col_top']")
+    center_z = float(geom.get("pos").split()[2])
+    half_depth, outer, half_height = (float(v) for v in geom.get("size").split())
+    return GateGeometry(inner=center_z - half_height, outer=outer, half_depth=half_depth)

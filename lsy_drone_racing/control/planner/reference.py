@@ -59,10 +59,12 @@ class ProgressReference:
         """Initialize a progress-based reference path.
 
         Args:
-            p, v, a:  positions, tangents, accelerations of all slots.
-            tangent_scale
-            pt_labels: 0: fixed, 1: extra
-            M:                    table samples per segment.
+            p: positions of all slots
+            v: tangents of all slots
+            a: accelerations of all slots
+            pt_labels: cf. LABEL constants in this class
+            tangent_scale: scaling factor for tangents
+            M: samples per segment for the dense progress reparameterization
         """
         self._p, self._v, self._a = p, v, a
         self._tangent_scale = tangent_scale
@@ -211,11 +213,10 @@ class ProgressReference:
     ) -> "ProgressReference":
         """Create a ProgressReference with changed gate positions.
 
-        We provide all of the variables with fixed shapes, to avoid triggering recompiles
         Args:
-            gates_pos
-            gates_normals
-            mask
+            gates_pos: (n_gates, 3) gates position
+            gates_normals: (n_gates, 3) gates normal vectors
+            mask: (n_gates, ) mask of gates that should be updated
         """
         p, v, a = self._p.copy(), self._v.copy(), self._a.copy()
 
@@ -229,7 +230,7 @@ class ProgressReference:
         )
 
     def without_extras(self) -> "ProgressReference":
-        """Set mask invalid for all current extra waypoints."""
+        """Returns reference without updateable points."""
         p, v, a = self._p.copy(), self._v.copy(), self._a.copy()
 
         keep = self._pt_labels != self.UPDATEABLE_LABEL
@@ -317,9 +318,9 @@ class ProgressReference:
         return np.flatnonzero(self._pt_labels == self.GATES_LABEL)
 
     def get_current_gate_positions(self, mask: NDArray) -> tuple:
-        """Returns current positions of the gates in the reference."""
+        """Returns current progress and positions of the gates in the reference."""
         slots = self._get_gate_slots()[mask]
-        return self._p[slots]
+        return self._s_samples[:: self._M][slots, None], self._p[slots]
 
     def sample(self, num_samples: int) -> tuple:
         """Draw num_samples points from spline equally spaced across u."""
