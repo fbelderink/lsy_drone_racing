@@ -102,14 +102,16 @@ class PathTracker:
         """The reference path around the drone's progress, as of the last `update`.
 
         The window reaches from window_behind to window_ahead times the reach around the
-        progress, clipped to the path, with a fixed number of points so that jitted users do not
-        recompile.
+        progress, with a fixed number of points so that jitted users do not recompile. It is
+        clipped to the start of the path, but continues straight past its end (the reference's
+        continuation along its final tangent): clipped there too, the window would offer no
+        progress beyond the end, and a controller rewarding progress would stop just short of it.
 
         Returns:
             (P, 4) positions and their progress relative to the drone's progress in meters.
         """
         ref = self._reference
-        s = np.clip(self._progress + self._offsets, 0.0, ref.length)
+        s = np.maximum(self._progress + self._offsets, 0.0)
         return np.column_stack([ref(s), s - self._progress])
 
     def _on_new_reference(self, ref: ProgressReference, obs: ObservationDict):
