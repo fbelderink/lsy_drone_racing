@@ -24,6 +24,11 @@ GATE_INNER_HALF_WIDTH = 0.2  # Half-width of the gate opening
 GATE_OUTER_HALF_WIDTH = 0.36  # Half-width of the frame's outer edge
 GATE_HALF_DEPTH = 0.01  # Half-thickness of the frame along the gate's normal
 GATE_STAND_HALF_WIDTH = 0.05  # Half-width of the square stand below the frame
+# A gate stacked onto a lower gate is mounted on that gate and has no stand (`race_core.py`). The
+# env decides this from the nominal poses with 5 cm and 5 deg tolerances; these are wider, since
+# both gates' observed poses can be randomized once revealed.
+STACKED_GATE_MAX_OFFSET = 0.2  # Horizontal distance between the gate centers in meters
+STACKED_GATE_MAX_ANGLE = np.deg2rad(20.0)  # Angle between the gate normals (or flipped normals)
 
 
 def array_module(*arrays: Array) -> ModuleType:
@@ -50,10 +55,29 @@ def obstacle_clearance(pos: Array, obstacles_pos: Array, inflation: Array, radiu
     return xp.min(xy_distance - radius - inflation[None, :], axis=-1)
 
 
+def gates_have_stand(gates: Array) -> Array:
+    """Check which gates stand on the ground, i.e. are not stacked onto a lower gate.
+
+    Args:
+        gates: Position and normal vector of every gate with shape (n_gates, 6).
+
+    Returns:
+        Flags with shape (n_gates,), False for a gate stacked onto a lower, parallel gate.
+    """
+    xp = array_module(gates)
+    pos, normal = gates[:, :3], gates[:, 3:]
+    # Entry [i, j] relates gate i to gate j below it
+    lower = pos[None, :, 2] < pos[:, None, 2]
+    near = xp.linalg.norm(pos[None, :, :2] - pos[:, None, :2], axis=-1) <= STACKED_GATE_MAX_OFFSET
+    parallel = xp.abs(normal @ normal.T) >= np.cos(STACKED_GATE_MAX_ANGLE)
+    return ~xp.any(lower & near & parallel, axis=-1)
+
+
 def gate_contact(pos: Array, gates: Array, drone_radius: float) -> Array:
     """Check which positions touch a gate's frame or stand.
 
     The gate's vertical axis is taken as the world z-axis, so its small roll and pitch are ignored.
+    Gates stacked onto a lower gate have no stand, see `gates_have_stand`.
 
     Args:
         pos: Positions with shape (n, 3).
@@ -82,6 +106,7 @@ def gate_contact(pos: Array, gates: Array, drone_radius: float) -> Array:
         (along_normal < GATE_STAND_HALF_WIDTH + drone_radius)
         & (horizontal < GATE_STAND_HALF_WIDTH + drone_radius)
         & (vertical < -GATE_OUTER_HALF_WIDTH)
+        & gates_have_stand(gates)[None, :]
     )
     return xp.any(frame | stand, axis=-1)
 
