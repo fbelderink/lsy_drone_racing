@@ -176,11 +176,7 @@ COST_CONSTANTS = {
     "deviation_tolerance": 0.13,  # Tolerance in meters for a deviation from the reference
     "contouring_tolerance": 0.13,  # Tolerance in meters for the distance to the path
     "velocity_tolerance": 0.5,  # Tolerance in m/s for flying faster than the reference speed
-    "smoothness_tolerance": 1.0,  # Tolerance for control smoothness in multiples of sigma
-    # Margin in meters the drone keeps from a gate's frame, on top of its collision radius. The
-    # frame's sizes ("gate_inner", "gate_outer", "gate_half_depth") and "drone_radius" are read
-    # from the MuJoCo models when the controller is created
-    "gate_margin": 0.01,
+    "smoothness_tolerance": 0.3,  # Tolerance for control smoothness in multiples of sigma
     # Largest distance in meters from a gate's center at which crossing its plane counts as a
     # miss; further away the plane is crossed elsewhere on the track, not at the gate
     "gate_miss_radius": 1.0,
@@ -200,9 +196,9 @@ COST_CONSTANTS = {
 
 COST_WEIGHTS = {
     "progress_weight": 30.0,  # Reward per meter of progress along the path, see `progress_cost`
-    "contouring_weight": 0.8,  # Weight for the distance to the path, see `contouring_cost`
+    "contouring_weight": 0.4,  # Weight for the distance to the path, see `contouring_cost`
     "smoothness_weight": 0.01,  # Weight for control smoothness
-    "gate_weight": 30.0,  # Weight for states inside a gate's frame
+    "gate_weight": 1.0,  # Weight for states inside a gate's frame
     "gate_miss_weight": 300.0,  # Weight for missing the next gate, see `gate_miss_cost`
     "obstacle_weight": 100.0,  # Weight for coming close to an obstacle
 }
@@ -406,7 +402,7 @@ def gate_frame_cost(pos: Array, gates: Array, cc: dict, w: Array) -> Array:
     Returns:
         The scalar cost.
     """
-    r = cc["drone_radius"] + cc["gate_margin"]
+    r = cc["drone_radius"]
     inner, outer = cc["gate_inner"] - r, cc["gate_outer"] + r
     along_normal, in_plane = gate_frame_coordinates(
         pos[:, None, :] - gates[None, :, :3], gates[None, :, 3:]
@@ -442,7 +438,7 @@ def gate_miss_cost(pos: Array, target_gate: Array, cc: dict) -> Array:
         The scalar cost, 1 if the rollout misses the gate, else 0.
     """
     center, normal, valid = target_gate[:3], target_gate[3:6], target_gate[6]
-    opening = cc["gate_inner"] - cc["drone_radius"] - cc["gate_margin"]
+    opening = cc["gate_inner"] - cc["drone_radius"]
 
     # steps (H,) that cross the plane forwards, and where between the two states they cross it
     x = (pos - center) @ normal
@@ -968,7 +964,7 @@ class AttitudeMPPI(Controller):
             return
         cyan, orange = (0.0, 0.9, 1.0, 1.0), (1.0, 0.5, 0.0, 0.4)
         # half width of the opening the drone's center can pass without touching the frame
-        safe = self._cc["gate_inner"] - self._cc["drone_radius"] - self._cc["gate_margin"]
+        safe = self._cc["gate_inner"] - self._cc["drone_radius"]
         for i, (pos, quat) in enumerate(zip(*self._gate_now)):
             # Earlier perceptions, linked to where the gate is perceived now
             for old_pos, old_quat in self._gate_old[i]:
